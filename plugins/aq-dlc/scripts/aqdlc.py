@@ -14,6 +14,7 @@
   $PL verify <risk id> <v id> "<方法>" --command "..." | --checks a,b | --manual "..."
   $PL phase <名前> / ask "<質問>" / resume / wait "<理由>" [--minutes N]
   $PL review --start | review --done --blocking N [--summary "..."]
+  $PL assume "<決めたこと>" [--out] / spec / spec --approve "<人間の返答の要約>"
   $PL memory-done / complete / abort
   $PL verify ... --after-merge / gate --after-merge / confirm <v id> "<人間の確認内容>"
   $PL ci [--wait 分]                          push 後に GitHub Actions の結果を確認
@@ -56,6 +57,7 @@ DEFAULTS = {
     },
     "automation": {
         "auto_start": True,
+        "spec_review": True,
         "max_auto_continues": 20,
         "max_fix_iterations": 8,
         "allow_github_ops": True,
@@ -573,6 +575,9 @@ def cmd_gate(args):
     state, spath = load_state(project)
     if not state:
         die("実行中のrunがありません。先に new を実行してください。")
+    sp = spec_problem(project, state)
+    if sp and not force:
+        die(f"{sp}。仕様の承認前は gate を実行しません（実装の前に仕様をすり合わせるため）。")
     if review_running(state) and not force:
         die("サブエージェント（独立レビューなど）の実行中は gate を実行しません。同じフォルダでテストが同時に動き、"
             "結果が壊れるためです。結果が届いてから gate を実行してください（どうしても必要なら --force）。")
@@ -824,6 +829,79 @@ def cmd_review(args):
     save_json(spath, state)
 
 
+def spec_hash(state):
+    body = json.dumps({
+        "req": [(r.get("id"), r.get("text"), bool(r.get("critical"))) for r in state.get("requirements", [])],
+        "assume": [a.get("text") for a in state.get("assumptions", [])],
+        "out": [o.get("text") for o in state.get("out_of_scope", [])],
+    }, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha1(body.encode("utf-8")).hexdigest()
+
+
+def cmd_assume(args):
+    """assume "<仮定・決めたこと>" [--out]   --out で「今回は作らないもの」として登録"""
+    out = pop_flag(args, "--out")
+    _p, state, spath = edit_state(args)
+    text = " ".join(args).strip()
+    if not text:
+        die('使い方: assume "<内容>" [--out]')
+    key = "out_of_scope" if out else "assumptions"
+    items = state.setdefault(key, [])
+    prefix = "O" if out else "A"
+    items.append({"id": f"{prefix}{len(items) + 1}", "text": text})
+    save_json(spath, state)
+    print(f"[aq-dlc] {'対象外' if out else '仮定'} {items[-1]['id']}: {text}")
+
+
+def spec_sheet(state):
+    lines = [f"# 仕様の確認: {state.get('title')}", "", "## 要求（受け入れ条件）"]
+    for r in state.get("requirements", []):
+        lines.append(f"- {r['id']}{' 【重要】' if r.get('critical') else ''} {r.get('text')}")
+        for k in r.get("risks", []):
+            vs = "、".join(v.get("method", "") + ("（マージ後）" if v.get("after_merge") else "")
+                          + ("（人が確認）" if v.get("manual") else "") for v in k.get("verifications", []))
+            lines.append(f"    - 想定する失敗: {k.get('text')}" + (f" → 確かめ方: {vs}" if vs else ""))
+    if state.get("assumptions"):
+        lines += ["", "## こちらで決めたこと（仮定）"]
+        lines += [f"- {a['id']} {a['text']}" for a in state["assumptions"]]
+    if state.get("out_of_scope"):
+        lines += ["", "## 今回は作らないもの"]
+        lines += [f"- {o['id']} {o['text']}" for o in state["out_of_scope"]]
+    return "\n".join(lines)
+
+
+def cmd_spec(args):
+    """spec                         仕様シートを表示（人間に見せる用）
+       spec --approve "<返答の要約>"  人間が承認したと答えた後だけ記録"""
+    approve = pop_opt(args, "--approve")
+    _p, state, spath = edit_state(args)
+    if approve is None:
+        print(spec_sheet(state))
+        s = state.get("spec") or {}
+        if s.get("approved"):
+            same = s.get("hash") == spec_hash(state)
+            print(f"\n（承認済み: {s.get('approved_at')}{'' if same else '／承認後に変更あり。再確認が必要'}）")
+        return
+    if not state.get("requirements"):
+        die("要求が登録されていません。")
+    state["spec"] = {"approved": True, "hash": spec_hash(state), "approved_at": now_iso(), "note": approve}
+    state["awaiting_human"] = False
+    advance(state, "03_implement")
+    save_json(spath, state)
+    print("[aq-dlc] 仕様の承認を記録しました。実装に進めます。")
+
+
+def spec_problem(project, state):
+    if not config(project)["automation"].get("spec_review", True):
+        return None
+    s = state.get("spec") or {}
+    if not s.get("approved"):
+        return "仕様が未承認（spec で仕様シートを作り、人間に確認して spec --approve）"
+    if s.get("hash") != spec_hash(state):
+        return "承認後に仕様（要求・仮定・対象外）が変わった（変更点を人間に確認して spec --approve）"
+    return None
+
+
 def cmd_ask(args):
     _p, state, spath = edit_state(args)
     state["awaiting_human"] = True
@@ -934,6 +1012,9 @@ def completion_problems(project, state, stage=None):
             names = (changed + added + removed)[:3]
             p.append(f"gate実行後に内容が変わったファイルがある（gateを再実行）: "
                      f"変更{len(changed)}・追加{len(added)}・削除{len(removed)}件（例: {', '.join(names)}）")
+    sp = spec_problem(project, state)
+    if sp:
+        p.append(sp)
     reqs = state.get("requirements", [])
     if not reqs:
         p.append("requirements が空")
@@ -1328,6 +1409,7 @@ COMMANDS = {
     "add-check": cmd_add_check, "remove-check": cmd_remove_check, "checks": cmd_checks,
     "req": cmd_req, "risk": cmd_risk, "verify": cmd_verify, "phase": cmd_phase,
     "wait": cmd_wait, "resume": cmd_resume, "review": cmd_review, "ask": cmd_ask,
+    "assume": cmd_assume, "spec": cmd_spec,
     "memory-done": cmd_memory_done, "complete": cmd_complete, "abort": cmd_abort,
     "confirm": cmd_confirm, "ci": cmd_ci, "doctor": cmd_doctor,
     "agent-start-hook": cmd_agent_start_hook, "agent-stop-hook": cmd_agent_stop_hook,
