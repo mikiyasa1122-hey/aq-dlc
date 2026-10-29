@@ -1,6 +1,6 @@
 # Evidence Graph（state.json の書き方）
 
-要求 → リスク → 検証 → 証拠 を `state.json` で結ぶ。証拠の `result` はエンジン（`gate`）だけが書く。
+要求 → リスク → 検証 → 証拠 を `state.json` で結ぶ。登録はエンジンの `req` / `risk` / `verify` コマンドで行い、JSONは手で編集しない。下は結果の形の説明。証拠の `result` はエンジン（`gate`）だけが書く。
 
 ```json
 {
@@ -44,7 +44,7 @@
 - verificationには `command` か `checks` のどちらかが必要。
 - 手動確認しかできないもの：`"manual": "確認手順"` を書き、人間に確認を依頼する。人間がOKしたら `"waived_by": "human", "waive_reason": "..."` を追記する。AIが自分でこれを書いてはいけない。
 - critical な requirement は、少なくとも1つのriskと1つのverificationが必要。
-- gate実行後に対象ファイルを変更すると、gate結果は stale（古い）扱いになり、完了判定は通らない。
+- gate実行後にファイルの**内容**が変わると、gate結果は古い扱いになり、完了判定は通らない（更新日時だけの変化は無視する）。
 
 ## 完了条件（`check` が見るもの）
 

@@ -12,6 +12,9 @@ description: 新規アプリをAQ-DLC方式で開発する。開いているフ�
 ## 言語
 ユーザーへの返答・質問・進捗報告、run.md、Memory、コミットメッセージ、PRのタイトルと本文、Issue、コード内のコメント、サブエージェントへの依頼は、**すべて日本語**で書く。英語のエラーやログは日本語で要約してから、必要な部分だけ引用する。コードの識別子やコマンドは英語のままでよい。
 
+## Windows で使うとき
+エンジンの入出力は UTF-8 に統一してある。テストやビルドのコマンドも UTF-8 で出力されるようにする（Python は `PYTHONUTF8=1` がエンジンから渡される。Node 等で文字化けする場合は `chcp 65001` を含めたコマンドにする）。パスは `/` 区切りで渡してよい。
+
 ## 自動で進める（既定の動き）
 - 依頼を受けたら、計画の承認を求めずに 00 から完了まで続けて進める。途中経過の報告は区切りごとに1〜2行でよい。
 - 決まっていないこと（技術スタック、画面構成、データ構造、命名、GitHubの公開範囲など）は、妥当な既定値を自分で選び、run.md の「仮定」に書いて進める。公開範囲の既定は設定の `github.default_visibility`。
@@ -21,19 +24,35 @@ description: 新規アプリをAQ-DLC方式で開発する。開いているフ�
 
 ## エンジン
 
-すべてのコマンドに、作成したプロジェクトの絶対パスを `--project` で渡す（Bashのカレントディレクトリに依存しないため）。
+すべてのコマンドに、プロジェクトの絶対パスを `--project` で渡す（Bashのカレントディレクトリに依存しないため）。`state.json` と `config.json` は**手で編集せず、次のコマンドで更新する**（JSONのエスケープ事故を防ぐため）。
 
 ```bash
 PL='python3 "${CLAUDE_PLUGIN_ROOT}/scripts/aqdlc.py"'
-$PL setup                                   # 初回のみ。~/.aq-dlc を初期化
-$PL init "<app名>"                           # 開いているフォルダを初期化し、絶対パスを出力
-$PL create "<app名>" [--parent DIR]          # 明示されたときだけ: サブフォルダを作って初期化
-$PL publish --project P [--visibility V]    # git init → GitHubリポジトリ作成 → push
-$PL new "<run名>" --project P                # runを開始
+# 準備
+$PL setup                                    # ~/.aq-dlc を初期化（何度でも可）
+$PL init "<app名>"                            # 開いているフォルダを初期化し、絶対パスを出力
+$PL create "<app名>" [--parent DIR]           # 明示されたときだけ: サブフォルダを作って初期化
+$PL publish --project P [--visibility V] [--dry-run]
+# run と Evidence Graph
+$PL new "<run名>" --project P
+$PL req R1 "<受け入れ条件>" [--critical] --project P
+$PL risk R1 K1 "<失敗・リスク>" --project P
+$PL verify K1 V1 "<確かめ方>" --command "<実行コマンド>" --project P   # または --checks test / --manual "<手順>"
+$PL phase <フェーズ名> --project P
+# Quality Gate
+$PL add-check <名前> "<コマンド>" [--timeout 秒] --project P   # remove-check / checks
+$PL gate --project P
+# レビュー・待機・確認
+$PL review --start --project P                # レビュー依頼の直前に実行（待機中は Stop hook が止めない）
+$PL review --done --blocking <重大な指摘の件数> --summary "<要約>" --project P
+$PL wait "<理由>" [--minutes N] --project P    # その他のバックグラウンド処理を待つとき。resume で解除
+$PL ask "<質問>" --project P                   # 人間に確認するとき。返答後に resume
+# 仕上げ
 $PL memory --tags a,b [--stack x] --project P
-$PL gate --project P                         # Quality Gate を実行し記録
+$PL memory-done --project P
 $PL status --project P
-$PL check --project P                        # 完了判定（Stop hook と同じ）
+$PL complete --project P                       # 完了条件を判定し、満たせば complete にする
+$PL abort --project P                          # 中断を指示されたとき
 ```
 
 役割分担：あなた（AI）は仕様理解・リスク提案・設計・実装・テスト・学習候補の抽出を担当する。エンジンは状態管理・gate実行・証拠照合・完了判定を担当する。完了は**自己申告で決めない**。
@@ -47,42 +66,43 @@ $PL check --project P                        # 完了判定（Stop hook と同�
 3. ファイル作成・編集は `P` の中で行う。Bashで別のフォルダにいる可能性がある場合は `cd "P" && ...` の形にする。
 4. `$PL publish --project P` でGitHubリポジトリを作る。公開範囲は、ユーザーの指定 → 全体設定の `github.default_visibility`（初期値 private）。gh が未ログインなら、その旨を伝えてローカルのgitだけで進める。
 5. `git -C "P" switch -c aq-dlc/<run名>` で作業ブランチを作る。
+6. publish は**最初のコミット前**に実行する。既存のgitリポジトリでは publish は新しいコミットを作らず、main への push もしない（コミット済みの作業ブランチだけを push する）。
 
 ## 01 run開始・Memory・要求
 1. `$PL new "<短い名前>" --project P`。
-2. 目的・想定技術・リスク領域からタグを決め、`$PL memory --tags ... --project P` で**関連するものだけ**読む。全件は読まない。`active` のRuleは従い、`validated` は参考にする。読んだidは `state.json` の `memory_loaded` に書く。
-3. 作る機能・受け入れ条件・重要な制約を `state.json` の `requirements` に書く。重要なものは `"critical": true`。新規開発なので既存実装の調査は不要。
+2. 目的・想定技術・リスク領域からタグを決め、`$PL memory --tags ... --project P` で**関連するものだけ**読む。全件は読まない。`active` のRuleは従い、`validated` は参考にする。読んだidは run.md の「読み込んだMemory」に書く。
+3. 作る機能・受け入れ条件・重要な制約を `$PL req` で登録する。重要なものは `--critical`。新規開発なので既存実装の調査は不要。
 4. 作り直しが大きくなる曖昧さだけユーザーに確認する（後述の手順で）。それ以外は妥当な判断で進め、run.md に「仮定」として残す。
 
 ## 02 Failure First
-各requirementについて、失敗・リスクを先に洗い出し `risks` に書く。観点：不正入力、権限・認可、境界値、データ不整合、エラー時の振る舞い、秘密情報、並行性（該当時）。各riskに `verifications` を最低1つ付ける（`references/evidence-graph.md`）。
+各requirementについて、失敗・リスクを先に洗い出し `$PL risk` で登録する。観点：不正入力、権限・認可、境界値、データ不整合、エラー時の振る舞い、秘密情報、並行性（該当時）。各riskに `$PL verify` で検証を最低1つ付ける（`references/evidence-graph.md`）。
 
 ## 03 設計・実装・テスト
-1. 技術スタックを決めたら、`P/.aq-dlc/config.json` の `checks` にその言語の検証コマンドを登録する（`references/quality-gate.md`）。選んだ理由は run.md と Project Memory に残す。
+1. 技術スタックを決めたら、`$PL add-check` でその言語の検証コマンドを登録する（`references/quality-gate.md`）。選んだ理由は run.md と Project Memory に残す。
 2. 実装とテストを書く。verificationの `command` から実行できる形にする。
 3. 区切りごとにコミットし、作業ブランチを push してよい。
 
 ## 04 Quality Gate ＋ 独立レビュー
 1. `$PL gate --project P`。
 2. 機械的な不整合（型・Lint・ビルド）を先に解消する。
-3. **aq-dlc:reviewer サブエージェント**にレビューを依頼する。渡すもの：プロジェクトパス、requirements と risks、変更ファイル一覧、gate結果。実装の経緯や自己評価は渡さない。
-4. レビューの「重大な指摘」の件数を `blocking_findings` として、結果を `state.json` の `review`（`done`、`blocking_findings`、`summary`）に記録する。
+3. `$PL review --start` を実行してから、**aq-dlc:reviewer サブエージェント**にレビューを依頼する。結果を待つ間はターンを終えてよい（sleep で待たない）。渡すもの：プロジェクトパス、requirements と risks、変更ファイル一覧、gate結果。実装の経緯や自己評価は渡さない。
+4. 結果が届いたら `$PL review --done --blocking <重大な指摘の件数> --summary "..."` で記録する。
 
 ## 05 修正ループ
-型エラー → 修正、テスト不足 → verification追加、仕様逸脱 → 実装修正、リスク漏れ → risk追加。修正後は必ず gate をやり直す（gate後の変更はstale扱い）。上限は `automation.max_fix_iterations`。超えたら人間に判断を仰ぐ。
+型エラー → 修正、テスト不足 → verification追加、仕様逸脱 → 実装修正、リスク漏れ → risk追加。修正後は必ず gate をやり直す（gate後に内容が変わったファイルがあると完了にできない。ブランチ切り替えなどで更新日時だけ変わった場合は影響しない）。上限は `automation.max_fix_iterations`。超えたら人間に判断を仰ぐ。
 
 ## 06 Memory整理
-**aq-dlc:memory Skill** の手順で、学びを選別・統合・保存する。終わったら `memory_done: true`。
+**aq-dlc:memory Skill** の手順で、学びを選別・統合・保存する。終わったら `$PL memory-done`。
 
 ## 完了
-1. `state.json` の `status` を `"complete"` にし、`$PL check --project P` を通す。NGなら直して戻る。
+1. `$PL complete --project P` を実行する。満たしていない条件が表示されたら、直して戻る。
 2. 作業ブランチを push し、`gh pr create` でPRを作る。PR本文には requirement → 証拠（gate結果）の対応表、残った注意点、保存したMemoryを書く。マージは人間が行う。
 3. ユーザーへの報告は短く：作ったもの、確かめた方法、PRのURL、残った注意点、確認待ちのMemory。
 
 ## 人間に確認するとき（例外だけ）
 - 対象：作り直しが大きい要求の曖昧さ、verificationの免除、秘密情報・課金・GitHub以外の外部サービスへの書き込み、プロジェクト外のファイル変更、テストや検証を弱める変更、修正ループ上限到達、Memory Review。
-- 手順：`state.json` に `"awaiting_human": true` と `"question"` を書いてから質問する。Stop hookはこの状態なら停止を許可する。返答を受けたら `false` に戻す。質問は1回にまとめ、可能なら複数選択式（AskUserQuestion）。
-- 中断を指示されたら `status` を `"aborted"` にする。
+- 手順：`$PL ask "<質問>"` を実行してから質問する。Stop hookはこの状態なら停止を許可する。返答を受けたら `$PL resume`。質問は1回にまとめ、可能なら複数選択式（AskUserQuestion）。
+- 中断を指示されたら `$PL abort`。
 
 ## してはいけないこと
 - テストや検証コマンドを弱める・消すことで gate を通す。

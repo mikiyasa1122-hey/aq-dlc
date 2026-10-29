@@ -50,7 +50,7 @@ Memoryの本文・見出し・タグ以外の記述、run.md への記録、ユ�
 
 ## 5. 人間確認（REVIEW）
 対象：Verified Rule の追加・変更・active化、active Memory との矛盾、deprecated化、project → global への昇格。
-1回の質問にまとめ、**複数選択式**で聞く。各項目は1〜2行で、何を、なぜ、根拠を書く。0件なら聞かない。質問前に `state.json` の `awaiting_human: true` と `question` を書く。
+1回の質問にまとめ、**複数選択式**で聞く。各項目は1〜2行で、何を、なぜ、根拠を書く。0件なら聞かない。質問前に `ask` コマンドを実行し、返答後に `resume` を実行する。
 
 ## 6. 実行記録を閉じる
-run.md の「Memory」節に、保存・統合したid、SKIP候補、REVIEWの結果、Skill改善提案を書く。最後に `memory_done: true`。
+run.md の「Memory」節に、保存・統合したid、SKIP候補、REVIEWの結果、Skill改善提案を書く。最後に `memory-done` コマンドを実行する。

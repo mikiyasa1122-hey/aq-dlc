@@ -1,6 +1,6 @@
 # Quality Gate — 言語別の check 例
 
-技術スタックが決まったら `.aq-dlc/config.json` の `checks` に登録する。使えないものは登録しない。存在しないツールを追加するより、そのスタックで標準的なものを選ぶ。
+技術スタックが決まったら `add-check` コマンドで登録する（例：`add-check test "pytest -q"`）。登録結果は `.aq-dlc/config.json` に保存される。使えないものは登録しない。存在しないツールを追加するより、そのスタックで標準的なものを選ぶ。
 
 ```json
 "checks": [

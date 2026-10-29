@@ -1,7 +1,7 @@
 {
   "name": "aq-dlc",
   "displayName": "AQ-DLC",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "証拠で完了する開発ループ。Failure First、Quality Gate、独立レビュー、成功・失敗のMemoryをMarkdownで管理する。",
   "author": {
     "name": "AQ-DLC contributors"
