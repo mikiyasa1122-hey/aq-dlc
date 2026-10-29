@@ -1,0 +1,14 @@
+{
+  "name": "aq-dlc",
+  "description": "AQ-DLC: 証拠で完了する個人開発ワークフローの Claude Code プラグイン",
+  "owner": {
+    "name": "AQ-DLC contributors"
+  },
+  "plugins": [
+    {
+      "name": "aq-dlc",
+      "source": "./plugins/aq-dlc",
+      "description": "証拠で完了する個人開発ワークフロー。開いたフォルダで新規開発し、成功と失敗をMarkdownのMemoryに蓄積する。"
+    }
+  ]
+}

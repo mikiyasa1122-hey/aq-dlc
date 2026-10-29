@@ -1,0 +1,9 @@
+# {app_name} — AQ-DLC で開発するプロジェクト
+
+- 開発・修正・機能追加の依頼は、コマンドがなくても AQ-DLC プラグインの手順（aq-dlc:start Skill）で自動で進める。決まっていないことは既定値を選び、run.md に「仮定」として残す。
+- 完了は自己申告ではなく、エンジンの `check` が通ったとき。Stop hook も同じ判定をする。
+- このプロジェクト固有の学びは `.aq-dlc/memory/project/`、プロジェクトをまたぐ学びは `~/.aq-dlc/memory/` に保存する。
+- プラグインのSkillやエージェント定義は書き換えない。改善案は run.md の「Skill改善提案」に書く。
+- 人間への確認は例外だけ。確認するときは、現在のrunの `state.json` に `awaiting_human: true` と `question` を書いてから質問する。
+- GitHub操作（commit、push、ブランチ作成、PR作成、Issue操作）は確認なしで行ってよい。作業は main 以外のブランチで行い、区切りごとにコミットする。
+- force push・履歴の書き換え、main への直接 push、PRのマージ、リポジトリ・ブランチ・リリースの削除、公開範囲の変更は人間が行う（hookでも止める）。

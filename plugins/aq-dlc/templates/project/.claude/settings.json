@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "defaultMode": "acceptEdits",
+    "allow": [
+      "Bash(python3:*)", "Bash(git:*)", "Bash(gh:*)",
+      "Bash(npm:*)", "Bash(npx:*)", "Bash(pnpm:*)", "Bash(yarn:*)", "Bash(node:*)", "Bash(bun:*)", "Bash(deno:*)",
+      "Bash(pip:*)", "Bash(pip3:*)", "Bash(uv:*)", "Bash(pytest:*)", "Bash(ruff:*)", "Bash(mypy:*)", "Bash(pyright:*)",
+      "Bash(go:*)", "Bash(cargo:*)", "Bash(swift:*)", "Bash(./gradlew:*)", "Bash(make:*)",
+      "Bash(ls:*)", "Bash(mkdir:*)", "Bash(cat:*)", "Bash(cp:*)", "Bash(mv:*)", "Bash(touch:*)"
+    ],
+    "deny": [
+      "Bash(sudo:*)",
+      "Bash(git push --force:*)", "Bash(git push -f:*)",
+      "Bash(gh repo delete:*)", "Bash(gh pr merge:*)"
+    ]
+  }
+}

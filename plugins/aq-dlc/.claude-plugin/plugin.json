@@ -1,0 +1,11 @@
+{
+  "name": "aq-dlc",
+  "displayName": "AQ-DLC",
+  "version": "0.1.0",
+  "description": "Evidence-driven development loop: Failure First, Quality Gate, independent review, and Success/Failure Memory in Markdown.",
+  "author": {
+    "name": "AQ-DLC contributors"
+  },
+  "license": "MIT",
+  "keywords": ["workflow", "quality", "testing", "memory", "evidence"]
+}

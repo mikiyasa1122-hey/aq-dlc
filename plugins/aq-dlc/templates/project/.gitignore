@@ -1,0 +1,14 @@
+# AQ-DLC: gateの生ログはコミットしない（結果は state.json に残る）
+.aq-dlc/runs/*/gate/
+.aq-dlc/runs/CURRENT
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# secrets
+.env
+.env.*
+!.env.example

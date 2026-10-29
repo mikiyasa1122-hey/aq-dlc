@@ -1,0 +1,12 @@
+# AQ-DLC Global Memory
+
+プロジェクトをまたいで使う学び。人が読めるMarkdownで管理する。
+
+- failure/ — 失敗の条件・根本原因・再発防止（F-）
+- success/ — Code Success（S-）と Workflow Success（W-）
+- rules/ — 検証済みルール（R-）。active化は人間の確認が必要
+
+状態：candidate → validated → active → deprecated（candidate は読み込まれない）
+初期ファイルは設計段階の例で、未検証のため candidate。
+
+このフォルダはプラグインとは別に、各自のPCに置かれる。個人の学びを公開したくない場合は、ここをgit管理する場合でも private リポジトリにする。
