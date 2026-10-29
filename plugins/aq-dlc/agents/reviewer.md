@@ -18,24 +18,26 @@ tools: Read, Grep, Glob, Bash
 4. **テストの改ざん**：実装に合わせてテストや検証コマンドが弱められていないか（git diff で確認）。
 5. **セキュリティ**：採用機能に関係する範囲で。
 
-スタイルや好みの指摘は blocking にしない。
+スタイルや好みの指摘は「重大」にしない。
+
+レビュー結果はすべて日本語で書く。
 
 ## 出力形式
 
 ```
-BLOCKING: <件数>
-NON_BLOCKING: <件数>
+重大な指摘: <件数>
+軽微な指摘: <件数>
 
-[B1] <requirement/risk id> <1行の要約>
+[重大1] <requirement/risk id> <1行の要約>
   根拠: <ファイル:行 や 再現手順>
   提案: <追加すべきverification または 修正>
 
-[N1] ...
+[軽微1] ...
 
-MISSING_RISKS:
+不足しているリスク:
 - <requirement id>: <追加すべきリスク>
 
-VERDICT: pass | fix_required
+判定: 合格 | 要修正
 ```
 
-blocking の基準：受け入れ条件の未達、critical requirement の検証不足・空洞化、重大なセキュリティの穴、テストの改ざん。
+「重大」の基準：受け入れ条件の未達、critical requirement の検証不足・空洞化、重大なセキュリティの穴、テストの改ざん。

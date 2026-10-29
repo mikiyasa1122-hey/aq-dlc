@@ -249,7 +249,7 @@ def run_cmd(cmd, cwd, timeout):
         p = subprocess.run(cmd, shell=True, cwd=cwd, capture_output=True, text=True, timeout=timeout)
         code, out = p.returncode, (p.stdout or "") + (p.stderr or "")
     except subprocess.TimeoutExpired:
-        code, out = 124, f"TIMEOUT after {timeout}s"
+        code, out = 124, f"タイムアウト（{timeout}秒）"
     return code, out, round(time.time() - start, 2)
 
 
@@ -426,7 +426,7 @@ def cmd_gate(args):
     for c in checks:
         r = record("check", c["name"], c["command"], int(c.get("timeout_sec", default_to)))
         results["checks"][c["name"]] = r
-        print(f"  {'PASS' if r['pass'] else 'FAIL'} check:{c['name']} ({r['sec']}s)")
+        print(f"  {'合格' if r['pass'] else '不合格'} チェック:{c['name']}（{r['sec']}秒）")
     for _q, _k, v in iter_verifications(state):
         vid = v.get("id", "?")
         if v.get("command"):
@@ -438,7 +438,7 @@ def cmd_gate(args):
         else:
             r = {"pass": False, "error": "command も checks もありません"}
         results["verifications"][vid] = r
-        print(f"  {'PASS' if r['pass'] else 'FAIL'} verify:{vid}")
+        print(f"  {'合格' if r['pass'] else '不合格'} 検証:{vid}")
 
     ok = bool(checks) and all(r["pass"] for r in results["checks"].values())
     state["gate"] = {"ran_at": now_iso(), "finished_epoch": time.time(), "stamp": stamp,
@@ -448,7 +448,7 @@ def cmd_gate(args):
     register_active(project, state["run_id"])
     if not checks:
         print("  ! .aq-dlc/config.json に checks がありません（完了条件を満たせません）")
-    print(f"[aq-dlc] gate結果: {'PASS' if ok else 'FAIL'}")
+    print(f"[aq-dlc] gate結果: {'合格' if ok else '不合格'}")
 
 
 def completion_problems(project, state):
@@ -639,7 +639,14 @@ def cmd_stop_hook(args):
                   "中断するなら status を aborted にしてください:\n- " + "\n- ".join(probs[:8]))
     state["stop_blocks"] = state.get("stop_blocks", 0) + 1
     save_json(spath, state)
+    reason += "\n（報告や記録はすべて日本語で書いてください）"
     print(json.dumps({"decision": "block", "reason": reason}, ensure_ascii=False))
+
+
+LANG_RULE = ("【言語】ユーザーへの返答、質問、進捗報告、run.md、Memory、コミットメッセージ、PRのタイトルと本文、"
+             "Issue、コード内のコメント、サブエージェントへの依頼と報告は、すべて日本語で書いてください。"
+             "英語のエラーやログを伝えるときは、日本語で要約してから必要な部分だけ引用してください。"
+             "コードの識別子やコマンドは英語のままで構いません。")
 
 
 def cmd_session_hook(args):
@@ -673,6 +680,7 @@ def cmd_session_hook(args):
                  "ユーザーが新しいアプリやツールの作成を依頼したら、コマンドを打たれなくても aq-dlc:start Skill を使い、"
                  "このフォルダを AQ-DLC プロジェクトとして初期化して開発してください。",
                  "開発以外の質問や雑談なら、通常どおり答えてください。"]
+    lines.append(LANG_RULE)
     print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart",
                                              "additionalContext": "\n".join(lines)}}, ensure_ascii=False))
 
@@ -752,7 +760,7 @@ def main():
         except SystemExit:
             raise
         except Exception as e:  # noqa: BLE001
-            print(f"[aq-dlc] hook error (ignored): {e}", file=sys.stderr)
+            print(f"[aq-dlc] hookでエラーが発生しました（作業は継続します）: {e}", file=sys.stderr)
         return
     COMMANDS[name](list(sys.argv[2:]))
 

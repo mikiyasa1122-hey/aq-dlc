@@ -9,6 +9,9 @@ description: 新規アプリをAQ-DLC方式で開発する。開いているフ�
 
 このSkillは**手順（固定）**を定める。学び（可変）は Memory にある。プラグインのファイルは書き換えない。改善が必要だと思ったら、run.md の「Skill改善提案」に書く。
 
+## 言語
+ユーザーへの返答・質問・進捗報告、run.md、Memory、コミットメッセージ、PRのタイトルと本文、Issue、コード内のコメント、サブエージェントへの依頼は、**すべて日本語**で書く。英語のエラーやログは日本語で要約してから、必要な部分だけ引用する。コードの識別子やコマンドは英語のままでよい。
+
 ## 自動で進める（既定の動き）
 - 依頼を受けたら、計画の承認を求めずに 00 から完了まで続けて進める。途中経過の報告は区切りごとに1〜2行でよい。
 - 決まっていないこと（技術スタック、画面構成、データ構造、命名、GitHubの公開範囲など）は、妥当な既定値を自分で選び、run.md の「仮定」に書いて進める。公開範囲の既定は設定の `github.default_visibility`。
@@ -63,7 +66,7 @@ $PL check --project P                        # 完了判定（Stop hook と同�
 1. `$PL gate --project P`。
 2. 機械的な不整合（型・Lint・ビルド）を先に解消する。
 3. **aq-dlc:reviewer サブエージェント**にレビューを依頼する。渡すもの：プロジェクトパス、requirements と risks、変更ファイル一覧、gate結果。実装の経緯や自己評価は渡さない。
-4. 結果を `state.json` の `review`（`done`、`blocking_findings`、`summary`）に記録する。
+4. レビューの「重大な指摘」の件数を `blocking_findings` として、結果を `state.json` の `review`（`done`、`blocking_findings`、`summary`）に記録する。
 
 ## 05 修正ループ
 型エラー → 修正、テスト不足 → verification追加、仕様逸脱 → 実装修正、リスク漏れ → risk追加。修正後は必ず gate をやり直す（gate後の変更はstale扱い）。上限は `automation.max_fix_iterations`。超えたら人間に判断を仰ぐ。

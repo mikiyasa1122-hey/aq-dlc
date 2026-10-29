@@ -1,8 +1,8 @@
 {
   "name": "aq-dlc",
   "displayName": "AQ-DLC",
-  "version": "0.1.0",
-  "description": "Evidence-driven development loop: Failure First, Quality Gate, independent review, and Success/Failure Memory in Markdown.",
+  "version": "0.1.1",
+  "description": "証拠で完了する開発ループ。Failure First、Quality Gate、独立レビュー、成功・失敗のMemoryをMarkdownで管理する。",
   "author": {
     "name": "AQ-DLC contributors"
   },

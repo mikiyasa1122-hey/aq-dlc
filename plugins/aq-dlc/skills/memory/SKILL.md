@@ -8,6 +8,9 @@ description: AQ-DLCのrun終了時（フェーズ06）に、成功・失敗の�
 記憶はモデルの再学習ではなく、Markdownの外部知識。形式は `${CLAUDE_PLUGIN_ROOT}/skills/start/references/memory-format.md`。
 閾値は設定の `memory`（`~/.aq-dlc/config.json`、プロジェクト側で上書き可）。
 
+## 言語
+Memoryの本文・見出し・タグ以外の記述、run.md への記録、ユーザーへの質問はすべて日本語で書く（tags と stack は検索用に英小文字でよい）。
+
 ## 保存先
 - **global**（プロジェクトをまたぐ学び）：`~/.aq-dlc/memory/{failure,success,rules}/`
 - **project**（このプロジェクトだけの目的・技術・規約）：`<project>/.aq-dlc/memory/project/`
