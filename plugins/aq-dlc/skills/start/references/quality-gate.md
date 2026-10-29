@@ -19,6 +19,13 @@
 | Swift | — | `swiftlint` | `swift test` | `swift build` |
 | Kotlin/Gradle | — | `./gradlew lint` | `./gradlew test` | `./gradlew build` |
 
+## 検証の粒度
+verification の `command` は、そのリスクだけを確かめるようにテスト名で絞る（`vitest -t`、`playwright -g`、`pytest -k`、`go test -run`、`cargo test <名前>`）。ファイル全体を指すと、どの証拠がどの要求を支えているのかが曖昧になり、別のファイルを指していても気づけない。
+
+## E2E テストの注意
+- E2E は本番と同じビルド成果物に対して実行する。ビルドが失敗したら E2E を実行しない（古い成果物で合格してしまうため）。check は「build → e2e」の順に登録し、e2e のコマンドを `npm run build && npx playwright test` のようにつなげる。
+- テストファイルが0件のとき失敗するテストランナー（Vitest など）は、最初のテストを書いてから check を登録する。
+
 ## 順序の原則
 型チェックが利用できる言語では、機械的な不整合（型・Lint・ビルド）を解消してから独立レビューに渡す。
 
