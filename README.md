@@ -24,7 +24,7 @@
 Claude Code で次を実行します。
 
 ```
-/plugin marketplace add <GitHubユーザー名>/aq-dlc
+/plugin marketplace add mikiyasa1122-hey/aq-dlc
 /plugin install aq-dlc@aq-dlc
 ```
 
