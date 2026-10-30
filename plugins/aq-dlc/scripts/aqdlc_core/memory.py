@@ -424,6 +424,13 @@ def cmd_memory_scope(args):
     choice = args[0]
     cfg = config(project)
     rd = run_dir(project, s.get("run_id"))
+    cur = s.get("memory_scope") or {}
+    if cur.get("source") == "config" and cur.get("choice") != choice:
+        die(f"この run の Memory の利用範囲は、設定（memory_policy.scope_default）で「{cur.get('choice')}」に決まっています。"
+            "変える場合は人間が設定を変えてください（エージェントは変えられません）。")
+    if cur.get("source") == "config" and cur.get("choice") == choice:
+        info(f"Memory の利用範囲は設定で「{choice}」に決まっています（変更なし）。")
+        return
     asked = s.get("asked_seq", 0)
     replied = asked > 0 and last_human_seq(s) > asked
     ev = None

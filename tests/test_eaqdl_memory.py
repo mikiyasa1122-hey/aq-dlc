@@ -99,6 +99,10 @@ class TestScopeConsent(unittest.TestCase):
             s = e.state()
             self.assertEqual((s["memory_scope"]["choice"], s["memory_scope"]["source"]), ("all", "config"))
             self.assertNotIn("Memory の利用範囲", e.next())
+            # 設定で決まった利用範囲は、エージェントが memory-scope で変えられない（比較実験で見つかった不具合）
+            e.aq("memory-scope", "project", ok=False)
+            e.aq("memory-scope", "all")
+            self.assertEqual(e.state()["memory_scope"]["source"], "config")
         finally:
             e.cleanup()
 

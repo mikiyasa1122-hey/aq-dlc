@@ -56,7 +56,7 @@ $AQ trace     # 要求 → 受け入れ条件/リスク → 設計 → 実装 �
    - 「新しいフォルダを作って」と明示されたときだけ `$AQ create "<アプリ名>"`。
 3. `$AQ publish --project P`（公開範囲はユーザーの指定 → 設定の既定値）。gh が使えなければ、その旨を伝えてローカルの git で進める。
 4. `git -C "P" switch -c aq-dlc/<run名>` で作業ブランチを作り、`$AQ new "<run名>" --project P`。
-5. **Memory の利用範囲を人間に選んでもらう**（`next` が示す）。`$AQ ask "Memory の利用範囲"` の後、AskUserQuestion で「プロジェクト内だけ（推奨）」「Memory を使わない」「共通 Memory も使う（承認 MEMSCOPE-…）」を聞き、`$AQ memory-scope project|none|all`。共通 Memory は、人間がその選択肢を選んだときだけ使える（非対話の実行では `memory-scope project`）。続けて `$AQ memory --tags <タグ> --record` で関連する Memory を読む。
+5. **Memory の利用範囲を人間に選んでもらう**（`next` が求めたときだけ。設定 `memory_policy.scope_default` で決まっていれば聞かず、変えない）。`$AQ ask "Memory の利用範囲"` の後、AskUserQuestion で「プロジェクト内だけ（推奨）」「Memory を使わない」「共通 Memory も使う（承認 MEMSCOPE-…）」を聞き、`$AQ memory-scope project|none|all`。共通 Memory は、人間がその選択肢を選んだときだけ使える（非対話の実行では `memory-scope project`）。続けて `$AQ memory --tags <タグ> --record` で関連する Memory を読む。
 
 ### 人間の承認の書き方（すべての承認で共通）
 エンジンは「返答があった」ことと「対象を承認した」ことを区別する。承認が必要な操作では、エンジンが示す対象 ID を選択肢に入れる:
