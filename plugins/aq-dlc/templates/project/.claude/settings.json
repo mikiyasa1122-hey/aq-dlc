@@ -11,7 +11,8 @@
     "deny": [
       "Bash(sudo:*)",
       "Bash(git push --force:*)", "Bash(git push -f:*)",
-      "Bash(gh repo delete:*)", "Bash(gh pr merge:*)"
+      "Bash(git push --mirror:*)", "Bash(git push --force-with-lease:*)",
+      "Bash(gh repo delete:*)", "Bash(gh pr merge:*)", "Bash(gh release delete:*)"
     ]
   }
 }

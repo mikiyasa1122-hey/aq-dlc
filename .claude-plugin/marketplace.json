@@ -8,7 +8,7 @@
     {
       "name": "aq-dlc",
       "source": "./plugins/aq-dlc",
-      "description": "証拠で完了する個人開発ワークフロー。開いたフォルダで新規開発し、成功と失敗をMarkdownのMemoryに蓄積する。"
+      "description": "証拠で完了するマルチエージェント開発ワークフロー。統括と4つのサブエージェント（要求分析・設計・実装・独立レビュー）が、開いたフォルダで新規開発し、成功と失敗をMarkdownのMemoryに蓄積する。"
     }
   ]
 }

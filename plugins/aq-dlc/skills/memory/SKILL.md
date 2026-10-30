@@ -17,7 +17,7 @@ Memoryの本文・見出し・タグ以外の記述、run.md への記録、ユ�
 - 迷ったら project に置く。global への昇格は REVIEW。
 
 ## 1. 候補を抽出する
-現在のrunの `state.json`、`run.md`、gate結果、レビュー指摘から探す：
+現在の run の `status`・`trace`・`history` の出力、`run.md`、gate のログ、`artifacts/` の成果物（仕様書・設計書・実装報告・レビュー結果）から探す。各担当の気づきも Memory の候補になる（どの担当の工程で起きた失敗か、も記録する）：
 - **Failure**：gateやレビューで見つかった不具合・見落とし。条件と根本原因。
 - **Code Success**：再利用できる設計・実装パターン（証拠でpassしたもの）。
 - **Workflow Success**：手順として効いたこと。

@@ -1,58 +1,45 @@
-# Evidence Graph（state.json の書き方）
+# Evidence Graph と証拠の鮮度
 
-要求 → リスク → 検証 → 証拠 を `state.json` で結ぶ。登録はエンジンの `req` / `risk` / `verify` コマンドで行い、JSONは手で編集しない。下は結果の形の説明。証拠の `result` はエンジン（`gate`）だけが書く。
-
-```json
-{
-  "run_id": "20261029-1810-todo-app",
-  "title": "todo-app",
-  "status": "in_progress",
-  "phase": "02_failure_first",
-  "awaiting_human": false,
-  "question": "",
-  "memory_loaded": ["F-0001", "W-0001"],
-  "requirements": [
-    {
-      "id": "R1",
-      "text": "利用者は自分のデータのみ閲覧できる",
-      "critical": true,
-      "risks": [
-        {
-          "id": "K1",
-          "text": "他利用者のデータにアクセスできてしまう",
-          "verifications": [
-            {
-              "id": "V1",
-              "method": "権限の異なる利用者2人で統合テスト",
-              "command": "npm test -- tests/auth/isolation.test.ts",
-              "checks": ["test"]
-            }
-          ]
-        }
-      ]
-    }
-  ],
-  "review": { "done": false, "blocking_findings": 0, "summary": "" },
-  "memory_done": false
-}
+```
+要求 R ─┬─ 受け入れ条件 AC ── 検証 V ─┐
+        └─ リスク K ─────────── 検証 V ─┼─ 実行方法（command / checks）・テストの場所 ── gate の結果
+要求 R ── 設計要素（design-map） ── 実装ファイル（impl-map）
 ```
 
-## ルール
+`trace` で、要求ごとに「受け入れ条件・リスク → 設計 → 実装ファイル → 検証（レベル）→ テスト → 結果（古いかどうか）」を一覧できる。
 
-- **command**：そのverificationだけを確かめるコマンド。gateが実行し、終了コード0ならpass。できるだけ書く。
-- **checks**：configのcheck名（例 `"test"`, `"typecheck"`）。gateでそのcheckがpassならpassとして扱う。commandが書けない場合の代替。
-- verificationには `command` か `checks` のどちらかが必要。
-- マージ後にしか確かめられないもの（デプロイ後の公開URLなど）：`--after-merge` を付ける。PR作成前の判定からは外れ、マージ後に `gate --after-merge` で実行する。
-- 手動確認しかできないもの：`verify ... --manual "確認手順"` で登録し、他の手動確認とまとめて1回で人間に依頼する。人間が確認したと答えたら `confirm <id> "<返答の要約>"` で記録する。人間の返答なしに confirm してはいけない。
-- critical な requirement は、少なくとも1つのriskと1つのverificationが必要。
-- gate実行後にファイルの**内容**が変わると、gate結果は古い扱いになり、完了判定は通らない（更新日時だけの変化は無視する）。
+## 登録するコマンドと担当
 
-## 完了条件（`check` が見るもの）
+| コマンド | 担当 | 内容 |
+|---|---|---|
+| `req R1 "<要求>" [--critical] [--kind nonfunctional]` | 要求分析 | 要求 |
+| `accept R1 AC1 "<条件>"` | 要求分析 | 受け入れ条件 |
+| `risk R1 K1 "<失敗>"` | 要求分析 | リスク（Failure First） |
+| `verify AC1 V1 "<確かめ方>" --level L [--manual "..."] [--after-merge]` | 要求分析 | 検証 |
+| `question Q1 "<質問>" --options "A（推奨）\|B"` / `assume "<内容>" [--out]` / `drop <ID>` | 要求分析 | 質問・仮定・対象外・削除 |
+| `design-map R1 "<設計要素>"` / `decision "<判断>"` | 設計 | 設計の対応・判断 |
+| `add-check <名前> "<コマンド>" --kind K [--needs a,b]` | 設計（実装も可） | Quality Gate のチェック |
+| `bind V1 --command "..." --test "..." [--level L] [--checks a,b]` | 実装（設計はレベルのみ） | 検証の実行方法 |
+| `impl-map R1 --files a,b` | 実装 | 実装ファイル |
 
-1. `config.json` に1つ以上の check が登録されている
-2. 最新のgateで全checkがpass、かつgate後にファイル変更がない
-3. 全verificationがpass（または人間の confirm）。マージ後の検証は、PR前の判定では除外
-7. GitHub Actions がある場合、最新コミットの CI が成功（`ci` で記録）
-4. critical requirementにrisk/verificationがある
-5. `review.done == true` かつ `review.blocking_findings == 0`
-6. `memory_done == true`
+state.json は直接編集しない。変更はすべて `history` に残り、独立レビューで確認される。
+
+## ID のルール
+- ID は run 全体で一意（要求・受け入れ条件・リスク・検証・質問をまたいで重複不可）。
+- 既に使われている ID を別の場所で使おうとすると拒否される（検証結果の上書きを防ぐ）。
+- 手で state.json を編集して重複させた場合も、gate と完了判定が拒否する。
+
+## 証拠の鮮度（指紋）
+gate は次の指紋と一緒に結果を記録し、どれかが変わると結果を使わない。
+
+| 指紋 | 対象 |
+|---|---|
+| コード | プロジェクトのファイル内容（.gitignore 済み・`.aq-dlc`・`.claude`・ビルド出力などを除く）。更新日時だけの変化は無視する |
+| チェックの定義 | 名前・コマンド・種類・前提・タイムアウト・gate の環境変数 |
+| 各検証の条件 | コマンド・参照するチェックの定義・レベル・手動/マージ後の区別・タイムアウト |
+
+独立レビューは、コード・Evidence Graph（検証条件を含む）・チェックの定義・仕様・設計の指紋と一緒に記録され、どれかが変わると再レビューが必要になる。
+
+## 人の確認とマージ後の検証
+- 人にしか確かめられないもの: `verify ... --manual "<手順>"`。`ask` → 人間の返答 → `confirm <ID> "<返答の要約>"`。
+- マージ後にしか確かめられないもの: `--after-merge`。PR 前の判定から外れ、マージ後に `gate --after-merge`（自動）または confirm（人の確認）。
