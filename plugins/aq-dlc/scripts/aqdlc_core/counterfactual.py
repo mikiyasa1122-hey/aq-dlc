@@ -217,13 +217,9 @@ def cleanup_stale(max_age=6 * 3600):
         marker = os.path.join(d, ".aqdlc-cf-owner")
         alive = False
         try:
-            pid = int(open(marker, encoding="utf-8").read().strip() or 0)
-            if pid and pid != os.getpid():
-                try:
-                    os.kill(pid, 0)
-                    alive = True
-                except (OSError, SystemError, ValueError):
-                    alive = False
+            with open(marker, encoding="utf-8") as f:
+                pid = int(f.read().strip() or 0)
+            alive = _pid_alive(pid) if pid and pid != os.getpid() else False
         except (OSError, ValueError):
             pass
         try:
@@ -235,6 +231,23 @@ def cleanup_stale(max_age=6 * 3600):
             _rmtree(d)
             removed += 1
     return removed
+
+
+def _pid_alive(pid):
+    if os.name == "nt":
+        # Windows の os.kill(pid, 0) はプロセスを終了させるため使わない。tasklist で確かめる
+        import subprocess
+        try:
+            out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH"], capture_output=True, text=True,
+                                 timeout=10).stdout
+            return str(pid) in out
+        except (OSError, subprocess.SubprocessError):
+            return True  # 分からなければ消さない（古さで判定する）
+    try:
+        os.kill(pid, 0)
+        return True
+    except (OSError, SystemError, ValueError):
+        return False
 
 
 def _unlink_dep_links(d):

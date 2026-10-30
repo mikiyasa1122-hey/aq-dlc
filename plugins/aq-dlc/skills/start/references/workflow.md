@@ -3,10 +3,14 @@
 フェーズは状態から自動で決まる（`next` で確認）。各工程の成果物は、作成時点の指紋と一緒に記録され、指紋が今の状態と一致するものだけが証拠になる。
 
 ```
-依頼 ─▶ 要求分析 ─▶ 人間の確認 ─▶ 設計 ─▶ 実装 ─▶ Quality Gate ─▶ 独立レビュー ─▶ Memory ─▶ CI・PR ─▶（マージ後の確認）
-          ▲  質問・回答 ┘            ▲        ▲          │ 不合格           │ 要修正
-          └──────── 仕様の指摘 ───────┴─ 設計の指摘 ┴──── 実装・テストの指摘 ◀┘
+依頼 ─▶ Memory の利用範囲 ─▶ 要求分析 ─▶ 人間の確認 ─▶ 設計 ─▶ 実装 ─▶ Quality Gate ─▶ 反証テスト ─▶ 独立レビュー ─▶ Memory ─▶ CI・PR
+        （人間が選ぶ）    ▲  質問・回答 ┘            ▲        ▲          │ 不合格     │ 見逃し(enforce) │ 要修正
+                          └──────── 仕様の指摘 ───────┴─ 設計の指摘 ┴──── 実装・テストの指摘 ◀──────────────┘
+各サブエージェントの起動時: 工程・技術分野に応じた Role Profile をエンジンが選んで引き継ぎ情報に加える（権限は変わらない）
 ```
+
+- 反証テスト（`cf`）は `counterfactual.mode` が advisory / enforce のときだけの工程。off（既定）では実行されず、`evidence` では「合格・反証未実施」と表示される。
+- 独立レビューは、反証テストの結果（advisory / enforce のとき）と Role Profile の版にも紐付く。どちらかが変わるとレビューはやり直しになる。
 
 ## サブエージェントの起動条件（PreToolUse: Agent）
 
@@ -48,3 +52,14 @@
 ## 人間の確認の記録
 
 `spec --approve`・`answer`・`confirm` は、それぞれ「提示」「質問の登録」「ask」の**後に**人間の返答（ユーザーの発言、AskUserQuestion の回答）が hook で記録されていないと受け付けない。
+
+## E-AQDL で加わった条件
+
+| 条件 | 内容 |
+|---|---|
+| Memory の利用範囲 | run の開始時に `memory-scope none|project|all`。未選択の間は設計・実装・レビューに進めず、共通 Memory も読まない。`all` は「承認 MEMSCOPE-…」か設定が必要 |
+| 承認の対象 | 仕様・設定・人の確認・Memory の利用と共有・等価な変異の除外は、対象 ID（SPEC- / CFG- / 検証ID / MEMSCOPE- / SHARE- / MEM- / EQ-）と決定（承認・却下）を1行で書いた人間の返答だけを決定とする。承認は対象・決定・時刻・run・元の返答と一緒に state と監査ログ（runs/<run>/audit.jsonl）に残る |
+| 状態の整合性 | state.json の保存時にスキーマ・状態・参照 ID・gate とレビューと承認の整合性を確かめ、新たな矛盾を持ち込む保存と、読み込み後の同時更新を拒否する。既に壊れていれば `state_invalid` として人間に知らせ、先に進めない |
+| Hook の異常 | 重要な PreToolUse（Bash・Write/Edit・Agent）の判定でエラー・入力の読み取り失敗・状態の読み取り失敗が起きたら、E-AQDL のプロジェクトでは拒否する（~/.aq-dlc/audit.jsonl に記録） |
+| 反証テスト | advisory / enforce では gate の後に `cf` が必要。enforce では、重要な要求の検証が欠陥を見逃す（survived）か反証が成立しない（invalid / timeout のみ）とレビュー・完了に進めない |
+| Memory の終了 | `memory-done --end project|share|none`。共有は候補ごとの人間の承認 |

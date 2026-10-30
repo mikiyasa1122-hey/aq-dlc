@@ -180,8 +180,14 @@ class TestCounterfactualGate(unittest.TestCase):
     def test_cf_add_rejects_bad_paths(self):
         e = self.e
         e.aq("cf-add", "V1", "--file", "../outside.py", "--line", "1", "--op", "negate_if", ok=False)
-        os.symlink(os.path.join(e.project, "src", "memo.py"), os.path.join(e.project, "src", "link.py"))
-        e.aq("cf-add", "V1", "--file", "src/link.py", "--line", "1", "--op", "negate_if", ok=False)
+        try:
+            os.symlink(os.path.join(e.project, "src", "memo.py"), os.path.join(e.project, "src", "link.py"))
+        except (OSError, NotImplementedError):
+            link = False  # Windows で権限がない場合
+        else:
+            link = True
+        if link:
+            e.aq("cf-add", "V1", "--file", "src/link.py", "--line", "2", "--op", "negate_if", ok=False)
         e.aq("cf-add", "V1", "--file", "src/memo.py", "--line", "4", "--op", "negate_if", ok=False)  # 適用不可
         e.aq("cf-add", "V1", "--file", "src/memo.py", "--line", "1", "--op", "rm -rf /", ok=False)
         self.assertTrue(denied(e.as_role("implementer", "cf-add", "V1", "--file", "src/memo.py", "--line", "1",
