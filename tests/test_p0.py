@@ -214,7 +214,8 @@ class P03BashBypassTest(unittest.TestCase):
 
     def test_design_script_write(self):
         write_file(os.path.join(self.e.tmp, "w.sh"), "echo '# y' >> \"$1\"\n")
-        self.assert_violation("design", f"sh {os.path.join(self.e.tmp, 'w.sh')} src/memo.py")
+        script = os.path.join(self.e.tmp, "w.sh").replace(os.sep, "/")  # bash に渡すため / 区切り
+        self.assert_violation("design", f"sh '{script}' src/memo.py")
 
     def test_requirements_variable_expansion(self):
         self.assert_violation("requirements", "F=src/memo.py; T=$F; printf x >> \"$T\"")
