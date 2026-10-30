@@ -134,6 +134,13 @@ class TestCounterfactualGate(unittest.TestCase):
         rec = e.state()["counterfactual"]["latest"]
         self.assertEqual(rec["summary"]["counts"]["survived"], 0)
         self.assertIn("独立レビュー", e.next())
+        m = json.loads(e.aq("metrics", "--json"))
+        self.assertEqual(m["counterfactual"]["runs"], 2)
+        self.assertIn("killed", m["counterfactual"]["score_definition"])
+        self.assertGreaterEqual(m["role_profiles"]["by_trigger"]["sendback"], 1)
+        self.assertEqual(m["memory"]["scope"], "project")
+        self.assertEqual(m["conditions"]["engine"], "E-AQDL")
+        self.assertIn("E-AQDL", e.aq("metrics", "--runs"))
 
     def test_reviewer_must_address_survived_in_advisory(self):
         e = self.e

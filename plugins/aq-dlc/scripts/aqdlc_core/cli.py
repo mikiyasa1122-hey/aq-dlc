@@ -1094,6 +1094,8 @@ def _metrics_runs(args, as_json):
     rows = []
     d = runs_dir(project)
     for rid in sorted(os.listdir(d)) if os.path.isdir(d) else []:
+        if not os.path.isfile(os.path.join(d, rid, "state.json")):
+            continue
         st = load_json(os.path.join(d, rid, "state.json"), None)
         if not isinstance(st, dict):
             continue
