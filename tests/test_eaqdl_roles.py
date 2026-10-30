@@ -175,7 +175,10 @@ class TestPermissionsUnchanged(unittest.TestCase):
             e.cleanup()
 
     def test_agent_definitions_have_no_permission_from_profiles(self):
-        out = os.popen(f'"{sys.executable}" "{os.path.join(ROOT, "plugins", "aq-dlc", "scripts", "aqdlc.py")}" roles --check').read()
+        import subprocess
+        out = subprocess.run([sys.executable, os.path.join(ROOT, "plugins", "aq-dlc", "scripts", "aqdlc.py"), "roles",
+                              "--check"], capture_output=True, encoding="utf-8",
+                             env=dict(os.environ, PYTHONUTF8="1", PYTHONIOENCODING="utf-8")).stdout
         self.assertIn("OK", out)
         self.assertNotIn("NG", out)
 

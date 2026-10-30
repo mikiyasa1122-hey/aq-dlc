@@ -218,7 +218,8 @@ class TestCounterfactualGate(unittest.TestCase):
         res = {m["verification"]: m for m in rec["mutations"]}
         self.assertEqual(res["V1"]["result"], "invalid")
         self.assertIn("ベースライン", res["V1"]["reason"])
-        self.assertIn("timeout", {m["result"] for m in rec["mutations"] if m["verification"] != "V1"})
+        others = [(m["id"], m["result"], m["reason"]) for m in rec["mutations"] if m["verification"] != "V1"]
+        self.assertIn("timeout", {r for _i, r, _w in others}, others)
         self.assertEqual(os.listdir(self.cf_dir()), [])
 
     def test_stale_sandbox_is_cleaned(self):
