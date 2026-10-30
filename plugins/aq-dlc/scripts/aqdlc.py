@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""AQ-DLC エンジンの入口。本体は aqdlc_core パッケージ（Python 3.8+ 標準ライブラリのみ）。
+"""E-AQDL エンジンの入口。本体は aqdlc_core パッケージ（Python 3.8+ 標準ライブラリのみ）。
 
   python3 aqdlc.py help        コマンド一覧
   python3 aqdlc.py hook <名前>  Claude Code の hook から呼ばれる

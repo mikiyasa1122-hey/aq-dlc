@@ -107,6 +107,19 @@ class Env:
     def human_says(self, text="はい、それで進めてください"):
         self.hook("user-prompt", {"prompt": text})
 
+    def spec_target(self):
+        import re
+        out = self.aq("spec")
+        return re.search(r"仕様 ([0-9a-f]{8})", out) and "SPEC-" + re.search(r"仕様 ([0-9a-f]{8})", out).group(1)
+
+    def approve_spec(self, note="ユーザーが仕様を承認"):
+        """仕様を提示し、人間が対象を指定して承認する流れ。"""
+        import re
+        out = self.aq("spec", "--present")
+        target = re.search(r"承認 (SPEC-[0-9a-f]{8})", out).group(1)
+        self.human_says(f"承認 {target}")
+        return self.aq("spec", "--approve", note)
+
     def human_answers(self, answers):
         self.hook("post-ask", {"tool_name": "AskUserQuestion", "tool_input": {"questions": []},
                                "tool_response": {"answers": answers}})
@@ -271,11 +284,14 @@ if __name__ == "__main__":
 '''
 
 
-def build_to_review(e, with_question=True):
-    """仕様承認 → 設計 → 実装 → gate 合格まで進める（各テストの前提）。"""
+def build_to_review(e, with_question=True, config=None):
+    """仕様承認 → 設計 → 実装 → gate 合格まで進める（各テストの前提）。config: プロジェクト設定に足す項目。"""
     py = f'"{sys.executable}"'
     e.aq("init", "メモ")
+    if config:
+        edit_json(os.path.join(e.project, ".aq-dlc", "config.json"), lambda c: c.update(config))
     e.aq("new", "メモ")
+    e.aq("memory-scope", "project")
     assert not denied(e.spawn("requirements"))
     e.start("requirements")
     e.as_role("requirements", "req", "R1", "メモを追加できる", "--critical")
@@ -298,9 +314,7 @@ def build_to_review(e, with_question=True):
         e.write_as("requirements", os.path.relpath(os.path.join(e.arts, "spec.md"), e.project),
                    SPEC_MD + "\n（Q1: 制限なしで確定）\n")
         assert e.stop("requirements", "回答を反映") is None
-    e.aq("spec", "--present")
-    e.human_says("この仕様で進めてください")
-    e.aq("spec", "--approve", "ユーザーが『この仕様で進めて』と返答")
+    e.approve_spec("ユーザーが『この仕様で進めて』と返答")
     assert not denied(e.spawn("design"))
     e.start("design")
     s = e.state()

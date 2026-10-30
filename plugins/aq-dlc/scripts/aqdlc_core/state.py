@@ -16,10 +16,13 @@ import time
 
 from . import gate as G
 from .project import config, register_active
-from .util import (die, fingerprint, load_json, now_iso, read_text, save_json, sha1_text,
+from .util import (FileLock, die, fingerprint, load_json, now_iso, read_text, save_json, sha1_text,
                    short, slugify)
 
 SCHEMA = 2
+# E-AQDL で追加した機能の版（0 = AQ-DLC v0.5 以前に始まった run。新しい承認・同意の条件は求めない）
+EAQDL = 1
+STATUSES = ("in_progress", "pr_ready", "complete", "closed", "aborted")
 ROLES = ("requirements", "design", "implementer", "reviewer")
 ROLE_LABEL = {"requirements": "要求分析（aq-dlc:requirements）", "design": "設計（aq-dlc:design）",
               "implementer": "実装（aq-dlc:implementer）", "reviewer": "独立レビュー（aq-dlc:reviewer）"}
@@ -66,10 +69,13 @@ def empty_state(rid, title):
         "gate": None, "reviews": [], "fix_iterations": 0,
         "human_events": [], "history": [],
         "memory_done": False, "ci": None, "after_merge_gate": False, "stop_blocks": 0,
+        "eaqdl": EAQDL, "approvals": [], "rev": 0,
     }
 
 
 def migrate(state):
+    if "eaqdl" not in state:
+        state["eaqdl"] = 0  # AQ-DLC v0.5 以前の run（読み取りの互換を保つ）
     base = empty_state(state.get("run_id", "?"), state.get("title", ""))
     for k, v in base.items():
         state.setdefault(k, v)
@@ -94,12 +100,136 @@ def load_state(project):
         return None, None
     p = os.path.join(d, "state.json")
     s = load_json(p, None)
-    return (migrate(s), p) if s else (None, None)
+    if not s:
+        return None, None
+    s = migrate(s)
+    s["_rev"] = int(s.get("rev", 0) or 0)
+    return s, p
+
+
+class StateError(Exception):
+    """state.json の保存を拒否した（整合性の違反・同時更新）。"""
 
 
 def save_state(spath, state):
-    save_json(spath, state)
+    """検証してから原子的に保存する。
 
+    - 保存しようとする内容の整合性を確かめ、新たな違反を持ち込む保存は拒否する
+      （既に壊れていた箇所は problems の state_invalid で人間に知らせる）
+    - 読み込んだ後に別のプロセスが保存していたら（rev の不一致）、上書きせずに拒否する
+    """
+    errs = validate_state(state)
+    with FileLock(spath):
+        disk = load_json(spath, None) if os.path.exists(spath) else None
+        if errs:
+            old = set(validate_state(migrate(dict(disk)))) if disk else set()
+            new = [e for e in errs if e not in old]
+            if new:
+                _audit_state(spath, "state.reject", {"errors": new[:10]})
+                raise StateError("状態の整合性に反する保存を拒否しました: " + "、".join(new[:5]))
+        disk_rev = int((disk or {}).get("rev", 0) or 0)
+        if disk is not None and "_rev" in state and state["_rev"] != disk_rev:
+            _audit_state(spath, "state.conflict", {"loaded_rev": state["_rev"], "disk_rev": disk_rev})
+            raise StateError("state.json が読み込み後に別の処理で更新されました（同時更新）。もう一度実行してください。")
+        state["rev"] = disk_rev + 1
+        save_json(spath, {k: v for k, v in state.items() if not k.startswith("_")})
+        state["_rev"] = state["rev"]
+
+
+def _audit_state(spath, event, detail):
+    from .approval import audit_append
+    audit_append(os.path.join(os.path.dirname(spath), "audit.jsonl"), event, **detail)
+
+
+def validate_state(state):
+    """スキーマ・状態遷移・参照 ID・gate とレビューと承認の整合性を確かめる（問題の一覧を返す）。
+
+    これはエンジンの不具合や単純な書き換えを見つけるためのもので、意図的な改ざんへの耐性を
+    保証するものではない。
+    """
+    from .approval import approved, target_id
+    errs = []
+    if not isinstance(state, dict):
+        return ["state が辞書ではない"]
+    if state.get("schema_version") != SCHEMA:
+        errs.append(f"schema_version が {SCHEMA} ではない")
+    if state.get("status") not in STATUSES:
+        errs.append(f"status が不正: {state.get('status')}")
+    seq = state.get("seq", 0)
+    if not isinstance(seq, int) or seq < 0:
+        errs.append("seq が不正")
+        seq = 0
+    reqs = state.get("requirements")
+    if not isinstance(reqs, list):
+        return errs + ["requirements が一覧ではない"]
+    req_ids = set()
+    for r in reqs:
+        if not isinstance(r, dict) or not ID_RE.match(str(r.get("id", ""))):
+            errs.append(f"要求の ID が不正: {r.get('id') if isinstance(r, dict) else r}")
+            continue
+        req_ids.add(r["id"])
+        for key in ("acceptance", "risks"):
+            for n in r.get(key, []) or []:
+                if not ID_RE.match(str(n.get("id", ""))):
+                    errs.append(f"{r['id']} の子の ID が不正: {n.get('id')}")
+                for v in n.get("verifications", []) or []:
+                    if not ID_RE.match(str(v.get("id", ""))):
+                        errs.append(f"{n.get('id')} の検証の ID が不正: {v.get('id')}")
+                    if v.get("confirmed_by") == "human" and state.get("eaqdl"):
+                        if not approved(state, target_id("", v.get("id"))):
+                            errs.append(f"{v.get('id')} が人間の確認済みだが、対象を指定した承認の記録がない")
+    for key in ("design", "impl"):
+        m = (state.get(key) or {}).get("map", {}) or {}
+        dangling = [k for k in m if k not in req_ids]
+        if dangling:
+            errs.append(f"{key} の対応表に存在しない要求がある: {', '.join(sorted(dangling)[:5])}")
+    for q in state.get("questions", []):
+        if q.get("status") not in ("open", "answered"):
+            errs.append(f"質問 {q.get('id')} の status が不正")
+        elif q.get("status") == "answered" and not q.get("answer"):
+            errs.append(f"質問 {q.get('id')} が回答済みだが回答がない")
+    sp = state.get("spec") or {}
+    if sp.get("approved_hash"):
+        if sp.get("approved_hash") == sp.get("presented_hash") and sp.get("presented_seq") \
+                and sp.get("approved_seq", 0) <= sp.get("presented_seq", 0):
+            errs.append("仕様の承認が提示より前に記録されている")
+        if state.get("eaqdl") and not approved(state, target_id("SPEC", sp["approved_hash"])):
+            errs.append("仕様が承認済みだが、対象（SPEC-…）を指定した人間の承認の記録がない")
+    g = state.get("gate")
+    if g:
+        res = g.get("results") or {}
+        if g.get("checks_pass") and (not res.get("checks") or
+                                     not all(r.get("pass") for r in (res.get("checks") or {}).values())):
+            errs.append("gate が合格になっているが、不合格・未実行のチェックがある")
+        if g.get("checks_pass") and g.get("modified_during_gate"):
+            errs.append("gate の実行中に変更があったのに合格になっている")
+        if g.get("seq", 0) > seq:
+            errs.append("gate の seq が全体の seq より大きい")
+    for rv in state.get("reviews", []):
+        if rv.get("passed") and (not rv.get("valid") or rv.get("verdict") != "合格" or rv.get("blocking", 0)):
+            errs.append(f"レビュー#{rv.get('n')} が合格になっているが、無効・判定が合格でない・重大な指摘がある")
+        if rv.get("seq", 0) > seq:
+            errs.append(f"レビュー#{rv.get('n')} の seq が全体の seq より大きい")
+    for i, rd in enumerate((state.get("impl") or {}).get("rounds", []), 1):
+        if rd.get("n") != i:
+            errs.append("実装の回の番号が連続していない")
+            break
+    for e in state.get("human_events", []):
+        if e.get("seq", 0) > seq:
+            errs.append("人間の返答の seq が全体の seq より大きい")
+            break
+    ms = state.get("memory_scope")
+    if ms:
+        if ms.get("choice") not in ("none", "project", "all"):
+            errs.append(f"Memory の利用範囲が不正: {ms.get('choice')}")
+        elif ms.get("choice") == "all" and ms.get("source") not in ("config", "approval"):
+            errs.append("共通 Memory の利用が、設定か人間の承認なしに記録されている")
+    cf = state.get("counterfactual") or {}
+    for run in cf.get("runs", []) or []:
+        for m in run.get("mutations", []) or []:
+            if m.get("result") not in ("killed", "survived", "invalid", "timeout", "not_applicable", None):
+                errs.append(f"反証テスト {m.get('id')} の結果が不正: {m.get('result')}")
+    return errs
 
 def require_state(project):
     s, p = load_state(project)
@@ -129,9 +259,11 @@ def log(state, project, action, detail):
                              "action": action, "detail": detail})
 
 
-def human_event(state, kind, text):
+def human_event(state, kind, text, parsed=True):
+    """人間の返答の記録。parsed=False は回答部分を取り出せなかったもの（承認の判定には使わない）。"""
     seq = bump(state)
-    state["human_events"].append({"seq": seq, "at": now_iso(), "kind": kind, "text": (text or "")[:500]})
+    state["human_events"].append({"seq": seq, "at": now_iso(), "kind": kind, "text": (text or "")[:2000],
+                                  "parsed": bool(parsed)})
     state["human_events"] = state["human_events"][-50:]
     return seq
 
@@ -156,7 +288,11 @@ def new_run(project, title):
     os.makedirs(os.path.join(d, "gate"), exist_ok=True)
     os.makedirs(artifacts_dir(d), exist_ok=True)
     st = empty_state(rid, title)
-    st["config_fp_registered"] = G.config_fp(config(project), project)
+    cfg = config(project)
+    st["config_fp_registered"] = G.config_fp(cfg, project)
+    default = (cfg.get("memory_policy") or {}).get("scope_default", "ask")
+    if default in ("none", "project", "all"):
+        st["memory_scope"] = {"choice": default, "source": "config", "at": now_iso(), "seq": 0}
     save_state(os.path.join(d, "state.json"), st)
     tmpl = read_text(os.path.join(project, ".aq-dlc", "run-template.md"), "# {title}\n")
     with open(os.path.join(d, "run.md"), "w", encoding="utf-8") as f:
@@ -359,9 +495,23 @@ def graph_issues(state):
 
 def problems(ctx, stage="pr"):
     """未充足の条件を、対応すべき順に返す。stage: pr = PR前（マージ後の検証を除く） / final = すべて"""
+    out = _problems(ctx, stage)
+    s = ctx.state
+    if s.get("eaqdl") and not s.get("memory_scope") and s.get("status") in ("in_progress", "pr_ready") \
+            and not (out and out[0]["code"] == "state_invalid"):
+        # run の開始時に選ぶ。ほかの未充足を隠さないように先頭に加える
+        out.insert(0, P("memory_scope", "Memory の利用範囲（使わない / プロジェクト内だけ / 共通も使う）が未選択", "human"))
+    return out
+
+
+def _problems(ctx, stage):
     s, cfg = ctx.state, ctx.cfg
     auto = cfg["automation"]
     out = []
+    bad = validate_state(s)
+    if bad:
+        out.append(P("state_invalid", "state.json の整合性が取れていない: " + "、".join(bad[:3]), "human"))
+        return out
     reg = s.get("config_fp_registered")
     if not reg and s.get("status") in ("in_progress", "pr_ready"):
         out.append(P("config_changed", "この run には設定の指紋が登録されていない（v0.5.1 より前に始まった run）。"
@@ -528,6 +678,30 @@ def problems(ctx, stage="pr"):
         out.append(P("gate_fail", f"gate が不合格: {what}", route))
         return out
 
+    from . import counterfactual as CF
+    cc = CF.cf_config(cfg)
+    if cc["mode"] != "off":
+        crec = CF.current(s)
+        if not crec:
+            out.append(P("cf_missing", "反証テスト（Counterfactual Gate）が未実行", "counterfactual"))
+            return out
+        st = CF.stale_reasons(ctx, crec)
+        if st:
+            out.append(P("cf_stale", "反証テストの後に変わったもの: " + "、".join(st), "counterfactual"))
+            return out
+        if cc["mode"] == "enforce":
+            gaps = CF.critical_gaps(s, crec)
+            surv = [g for g in gaps if g[2]]
+            if surv:
+                out.append(P("cf_survived", "重要な要求の検証が、埋め込んだ欠陥を見逃した: "
+                             + "、".join(f"{v}（{why}）" for v, why, _m in surv[:4])
+                             + "。テストを強化する", fix_route("implementer")))
+                return out
+            if gaps:
+                out.append(P("cf_insufficient", "重要な要求の検証で、反証テストが成立しなかった: "
+                             + "、".join(f"{v}（{why}）" for v, why, _m in gaps[:4]), "human"))
+                return out
+
     if not rv:
         bad = [r for r in s.get("reviews", []) if not r.get("valid")]
         why = f"（前回のレビューは無効: {bad[-1].get('invalid_reason')}）" if bad else ""
@@ -546,6 +720,12 @@ def problems(ctx, stage="pr"):
         rs.append("仕様")
     if rv.get("design_hash") != ctx.design_hash:
         rs.append("設計")
+    if rv.get("role_fp"):
+        from .agents import role_selection
+        if role_selection("reviewer", ctx)["fp"] != rv["role_fp"]:
+            rs.append("レビューの役割の定義（Role Profile）")
+    if cc["mode"] != "off" and rv.get("cf_fp") != CF.record_fp(s):
+        rs.append("反証テストの結果")
     if rs:
         out.append(P("review_stale", f"レビュー#{rv['n']} の後に {'・'.join(rs)} が変わった（再レビューが必要）",
                      "reviewer"))
@@ -605,7 +785,7 @@ def problems(ctx, stage="pr"):
     return out
 
 
-PHASE_OF_ROUTE = {"requirements": "要求整理", "human": "人間の確認", "orchestrator": "差し戻しの対応",
+PHASE_OF_ROUTE = {"counterfactual": "反証テスト", "requirements": "要求整理", "human": "人間の確認", "orchestrator": "差し戻しの対応",
                   "design": "設計", "implementer": "実装・修正", "gate": "Quality Gate",
                   "reviewer": "独立レビュー", "memory": "Memory 整理", "ci": "CI の確認",
                   "after_merge": "マージ後の確認"}
@@ -654,30 +834,53 @@ def instruction(p, ctx):
             hint += " prompt にはユーザーの依頼文をそのまま含める。"
         return head + "\n→ " + hint
     if r == "human":
+        if c == "state_invalid":
+            return (head + "\n→ run の記録が壊れているか、エンジン以外で書き換えられています。人間に状況を報告し、"
+                    "原因を確認してもらう（audit で監査ログを確認できる）。正しい状態に戻せない場合は new で run をやり直す。")
         if c == "questions_open":
             return (head + "\n→ show <質問ID> で内容を確認し、AskUserQuestion で人間に聞く（1回で最大4問）。"
                     "回答を answer <質問ID> \"<回答>\" で記録する。")
+        from .approval import target_id
         if c == "spec_unpresented":
+            t = target_id("SPEC", ctx.spec_hash)
             return (head + "\n→ spec --present で仕様シートを出し、要点を短く見せてから、AskUserQuestion で"
-                    "「この仕様で進めてよいか」を確認する。")
+                    f"「この仕様で進めてよいか」を確認する。選択肢は「この仕様で進める（承認 {t}）」と「修正したい」の形にする"
+                    f"（人間が「承認 {t}」を選ぶか書いた返答だけを承認として扱う）。")
         if c == "spec_unapproved":
-            return (head + "\n→ 人間が承認したら spec --approve \"<人間の返答の要約>\"。修正の要望なら "
+            t = target_id("SPEC", ctx.spec_hash)
+            return (head + f"\n→ 人間が「承認 {t}」を選んだ・書いたら spec --approve \"<人間の返答の要約>\"。"
+                    "「OK」などの対象のない返答は承認として扱われないので、選択肢を示して聞き直す。修正の要望なら "
                     "answer ではなく aq-dlc:requirements に修正を依頼する（依頼内容は question で記録してもよい）。")
         if c == "config_changed":
+            t = target_id("CFG", ctx.config_fp)
             return (head + "\n→ 変更前後の設定（git diff .aq-dlc/config.json、~/.aq-dlc/config.json）を確認し、ask を実行してから"
-                    "人間に変更を受け入れるか確認する。受け入れるなら config-accept \"<人間の返答の要約>\"、受け入れないなら"
-                    "人間に元に戻してもらう。")
+                    f"人間に変更を受け入れるか確認する（選択肢「受け入れる（承認 {t}）」「元に戻す」）。"
+                    f"「承認 {t}」の返答を得たら config-accept \"<人間の返答の要約>\"、受け入れないなら人間に元に戻してもらう。")
+        if c == "memory_scope":
+            from .memory import scope_target
+            t = scope_target(ctx.state)
+            return (head + "\n→ ask を実行してから AskUserQuestion で、この run の Memory の利用範囲を聞く。選択肢は"
+                    f"「プロジェクト内だけ（推奨）」「Memory を使わない」「共通 Memory も使う（承認 {t}）」。"
+                    "返答に合わせて memory-scope project|none|all を実行する（all は「承認 …」の返答が必要）。"
+                    "人間に聞けない実行（非対話）では memory-scope project を実行する（共通 Memory は使わない）。")
+        if c == "cf_insufficient":
+            return (head + "\n→ cf のログ（runs/<run>/cf/）で原因（テストの起動失敗・時間切れ・ベースライン不合格など）を確認し、"
+                    "ask を実行してから人間に方針を確認する（テスト環境を直す / counterfactual.mode を advisory に変える）。")
         if c == "manual_unconfirmed":
-            return (head + "\n→ ask \"<確認してほしいこと（まとめて）>\" を実行してから人間に確認し、"
-                    "確認できたものを confirm <検証ID> \"<人間の返答の要約>\" で記録する。")
+            return (head + "\n→ ask \"<確認してほしいこと（まとめて）>\" を実行してから人間に確認する。選択肢は検証ごとに"
+                    "「確認できた（承認 <検証ID>）」の形にし、その返答を得たものを confirm <検証ID> \"<人間の返答の要約>\" で記録する。")
         return head + "\n→ 修正ループが上限に達した。状況を要約し、ask を実行してから人間に方針を確認する。"
     if r == "orchestrator":
         return (head + "\n→ escalation で内容を確認する。仕様の変更が必要なら人間に確認して aq-dlc:requirements、"
                 "設計の変更なら aq-dlc:design に依頼する。対応したら escalation <ID> --resolve \"<対応>\"。")
     if r == "gate":
         return head + "\n→ gate を実行する。"
+    if r == "counterfactual":
+        return head + "\n→ cf を実行する（隔離したコピーで欠陥を埋め込み、テストが失敗するかを確かめる。計画だけなら cf --plan）。"
     if r == "memory":
-        return head + "\n→ aq-dlc:memory Skill の手順で学びを整理し、memory-done を実行する。"
+        return (head + "\n→ aq-dlc:memory Skill の手順（Software Reliability Engineer の観点: 証拠の実在・適用条件・"
+                "有害性）で学びを整理する。終了時の保存先（プロジェクト内だけ / 共有候補を1件ずつ承認 / 保存しない）を"
+                "人間に確認し、memory-done --end project|share|none を実行する。")
     if r == "ci":
         return head + "\n→ 作業ブランチを commit・push し、ci --wait 8 で結果を確認する。"
     if r == "after_merge":

@@ -57,6 +57,7 @@ class HumanReplyTest(unittest.TestCase):
         try:
             e.aq("init", "x")
             e.aq("new", "x")
+            e.aq("memory-scope", "project")
             e.aq("ask", "どちらにしますか")
             self.assertTrue(e.state()["awaiting_human"])
             e.human_says("A にしてください")
@@ -73,6 +74,7 @@ class BranchTest(unittest.TestCase):
         try:
             e.aq("init", "x")
             e.aq("new", "x")
+            e.aq("memory-scope", "project")
             for cmd in ("git switch -c impl/x", "git checkout -b impl/x", "git branch impl/x", "git checkout main"):
                 with self.subTest(cmd=cmd):
                     res = e.hook("pre-bash", {"tool_name": "Bash", "tool_input": {"command": cmd},

@@ -68,7 +68,7 @@ class WorkflowTest(unittest.TestCase):
         e.start("reviewer")
         self.assertIsNone(e.stop("reviewer", REVIEW_PASS))
         self.assertIn("Memory", e.next())
-        e.aq("memory-done", "--skipped", "テスト用の run のため保存する学びなし")
+        e.aq("memory-done", "--end", "project", "--skipped", "テスト用の run のため保存する学びなし")
         out = e.aq("complete")
         self.assertIn("complete", out)
         self.assertIsNone(e.hook("stop", {}))
@@ -81,6 +81,7 @@ class WorkflowTest(unittest.TestCase):
         e = self.e
         e.aq("init", "x")
         e.aq("new", "x")
+        e.aq("memory-scope", "project")
         for role in ("design", "implementer", "reviewer"):
             self.assertTrue(denied(e.spawn(role)), role)
         self.assertFalse(denied(e.spawn("requirements")))
@@ -98,6 +99,7 @@ class WorkflowTest(unittest.TestCase):
         e = self.e
         e.aq("init", "x")
         e.aq("new", "x")
+        e.aq("memory-scope", "project")
         e.spawn("requirements")
         e.start("requirements")
         e.as_role("requirements", "req", "R1", "a")
@@ -126,6 +128,8 @@ class WorkflowTest(unittest.TestCase):
         self.assertTrue(denied(e.spawn("implementer")))
         e.aq("gate", ok=False)  # 承認前は gate も動かない
         e.human_says("それでお願いします")
+        e.aq("spec", "--approve", "ユーザーが承認", ok=False)  # 対象（SPEC-…）のない返答は承認にしない
+        e.human_says(f"承認 {e.spec_target()}")
         e.aq("spec", "--approve", "ユーザーが承認")
         self.assertFalse(denied(e.spawn("design")))
         # 承認後に仕様が変わると、再承認まで設計・実装に進めない

@@ -1,14 +1,14 @@
 {
   "name": "aq-dlc",
-  "description": "AQ-DLC: 証拠で完了する個人開発ワークフローの Claude Code プラグイン",
+  "description": "E-AQDL（旧 AQ-DLC）: 証拠駆動の適応型品質開発ライフサイクルの Claude Code プラグイン",
   "owner": {
-    "name": "AQ-DLC contributors"
+    "name": "E-AQDL (AQ-DLC) contributors"
   },
   "plugins": [
     {
       "name": "aq-dlc",
       "source": "./plugins/aq-dlc",
-      "description": "証拠で完了するマルチエージェント開発ワークフロー。統括と4つのサブエージェント（要求分析・設計・実装・独立レビュー）が、開いたフォルダで新規開発し、成功と失敗をMarkdownのMemoryに蓄積する。"
+      "description": "E-AQDL（旧 AQ-DLC）: 証拠駆動の適応型品質開発ライフサイクル。統括と4つのサブエージェントが、工程・技術分野に応じた役割、反証テスト、未証明範囲の可視化、効果を検証する Memory（利用・共有は同意制）で開発する。"
     }
   ]
 }

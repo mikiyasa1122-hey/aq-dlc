@@ -59,7 +59,7 @@ def cmd_publish(args):
         if junk:
             info(f"生成物・秘密情報らしいファイル {len(junk)} 件は除外しました（例: {junk[0]}）")
         if files:
-            sh('git commit -q -m "初期化: AQ-DLC プロジェクトを作成"')
+            sh('git commit -q -m "初期化: E-AQDL プロジェクトを作成"')
     else:
         if sh("git rev-parse --verify HEAD", check=False)[0] != 0:
             die("git リポジトリにコミットがありません。コミットしてから再実行してください。")

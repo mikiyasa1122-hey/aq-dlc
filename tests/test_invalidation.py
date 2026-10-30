@@ -13,7 +13,7 @@ def finish_review(e):
     e.spawn("reviewer")
     e.start("reviewer")
     assert e.stop("reviewer", REVIEW_PASS) is None
-    e.aq("memory-done", "--skipped", "テスト用の run のため保存する学びなし")
+    e.aq("memory-done", "--end", "project", "--skipped", "テスト用の run のため保存する学びなし")
 
 
 class InvalidationTest(unittest.TestCase):
@@ -75,6 +75,10 @@ class InvalidationTest(unittest.TestCase):
         self.e.aq("config-accept", "確認しました", ok=False)  # ask と人間の返答がない
         self.e.aq("ask", "チェックのコマンドが変わりました。受け入れますか")
         self.e.human_says("受け入れます")
+        self.e.aq("config-accept", "人間が変更を受け入れた", ok=False)  # 対象（CFG-…）のない返答
+        import re
+        target = re.search(r"承認 (CFG-[0-9a-f]{8})", self.e.next()).group(1)
+        self.e.human_says(f"承認 {target}")
         self.e.aq("config-accept", "人間が変更を受け入れた")
         # 受け入れた後も、古い gate とレビューは使えない
         self.assert_stale(["チェックの定義"])

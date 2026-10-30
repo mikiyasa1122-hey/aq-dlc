@@ -13,9 +13,24 @@ class MemoryTest(unittest.TestCase):
     def setUp(self):
         self.e = Env()
         self.e.aq("init", "x")
+        # 共通 Memory を読むには明示的な設定（または run での人間の承認）が必要
+        p = os.path.join(self.e.project, ".aq-dlc", "config.json")
+        c = json.loads(read_file(p))
+        c["memory_policy"] = {"scope_default": "all"}
+        write_file(p, json.dumps(c))
 
     def tearDown(self):
         self.e.cleanup()
+
+    def test_common_memory_needs_consent(self):
+        e = self.e
+        p = os.path.join(e.project, ".aq-dlc", "config.json")
+        c = json.loads(read_file(p))
+        c.pop("memory_policy")
+        write_file(p, json.dumps(c))
+        out = e.aq("memory", "--all")
+        self.assertNotIn("F-0001", out)
+        self.assertIn("共通 Memory は使わない", out)
 
     def test_setup_and_listing(self):
         e = self.e
@@ -57,6 +72,9 @@ class HookTest(unittest.TestCase):
         e.aq("init", "x")
         e.aq("new", "x")
         ctx = e.hook("session-start", {})["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("Memory の利用範囲", ctx)  # E-AQDL: run の開始時に利用範囲を選ぶ
+        e.aq("memory-scope", "project")
+        ctx = e.hook("session-start", {})["hookSpecificOutput"]["additionalContext"]
         self.assertIn("統括", ctx)
         self.assertIn("aq-dlc:requirements", ctx)
         self.assertIn("日本語", ctx)
@@ -65,6 +83,7 @@ class HookTest(unittest.TestCase):
         e = self.e
         e.aq("init", "x")
         e.aq("new", "x")
+        e.aq("memory-scope", "project")
         res = e.hook("stop", {})
         self.assertTrue(blocked(res))
         self.assertIn("aq-dlc:requirements", res["reason"])
@@ -85,6 +104,7 @@ class HookTest(unittest.TestCase):
         e = self.e
         e.aq("init", "x")
         e.aq("new", "x")
+        e.aq("memory-scope", "project")
         code, out = e.run(["stop-hook"], stdin=json.dumps({"cwd": e.project}))
         self.assertEqual(code, 0)
         self.assertIn("block", out)
@@ -123,13 +143,16 @@ class CompletionTest(unittest.TestCase):
         e.start("reviewer")
         self.assertTrue(blocked(e.stop("reviewer", REVIEW_PASS)))  # 重要なリスク K2 の評価がない
         self.assertIsNone(e.stop("reviewer", REVIEW_PASS.replace("### E2E の要否", "- K2: V8 は公開後に人が確認（マージ後）\n### E2E の要否")))
-        e.aq("memory-done", "--skipped", "テスト用の run のため保存する学びなし")
+        e.aq("memory-done", "--end", "project", "--skipped", "テスト用の run のため保存する学びなし")
         out = e.aq("complete")
         self.assertIn("pr_ready", out)
         self.assertIsNone(e.hook("stop", {}))  # マージ待ちは止めない
         e.aq("confirm", "V8", "見ました", ok=False)  # ask の後の人間の返答がない
         e.aq("ask", "公開URLを開いて確認してください")
         e.human_says("開けました")
+        e.aq("confirm", "V8", "対象のない返答", ok=False)  # 「承認 V8」がない返答は確認にしない
+        e.aq("ask", "公開URLを開いて確認してください（確認できたら「承認 V8」）")
+        e.human_says("承認 V8")
         e.aq("confirm", "V8", "ユーザーが公開URLを確認")
         e.aq("gate", "--after-merge")
         e.aq("complete")

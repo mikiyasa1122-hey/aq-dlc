@@ -39,7 +39,7 @@ def review(verdict="判定: 合格", blocking=0, minor=0, findings="- なし"):
 
 
 def finish_memory(e):
-    e.aq("memory-done", "--skipped", "テスト用の小さな run のため保存する学びなし")
+    e.aq("memory-done", "--end", "project", "--skipped", "テスト用の小さな run のため保存する学びなし")
 
 
 class P01ReviewVerdictTest(unittest.TestCase):
