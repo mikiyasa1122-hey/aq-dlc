@@ -364,6 +364,16 @@ def bash_as(e, role, cmd, tool_use_id="t1"):
     pre = e.hook("pre-bash", payload)
     if denied(pre):
         return pre, None
-    subprocess.run(cmd, shell=True, cwd=e.project, env=e.env, capture_output=True)
+    subprocess.run([bash_path(), "-c", cmd], cwd=e.project, env=e.env, capture_output=True)
     post = e.hook("post-bash", dict(payload, tool_response={"stdout": "", "stderr": ""}))
     return pre, post
+
+
+def bash_path():
+    """Claude Code の Bash ツールと同じく bash で実行する（Windows では Git Bash）。"""
+    import shutil
+    if os.name == "nt":
+        for c in (r"C:\Program Files\Git\bin\bash.exe", r"C:\Program Files\Git\usr\bin\bash.exe"):
+            if os.path.exists(c):
+                return c
+    return shutil.which("bash") or "bash"

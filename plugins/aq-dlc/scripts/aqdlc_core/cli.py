@@ -402,6 +402,8 @@ def cmd_answer(args):
 
 def cmd_ask(args):
     def fn(project, s, a):
+        if not " ".join(a).strip():
+            die('使い方: ask "<人間に確認すること>"（質問の内容を必ず書く）')
         s.update(awaiting_human=True, question=" ".join(a), asked_seq=bump(s))
         s["asks_total"] = int(s.get("asks_total", 0)) + 1
         info("人間への確認待ちとして記録しました（返答を得たら resume）。")
