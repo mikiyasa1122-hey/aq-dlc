@@ -21,6 +21,12 @@ class Env:
                         GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.com",
                         GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.com")
         self.env.pop("CLAUDE_PROJECT_DIR", None)
+        # Claude Code の会話記録（人間の返答の照合に使う）を模擬する
+        self.claude_dir = os.path.join(self.tmp, "claude-config")
+        self.env["CLAUDE_CONFIG_DIR"] = self.claude_dir
+        self.transcript = os.path.join(self.claude_dir, "projects", "app", "session.jsonl")
+        os.makedirs(os.path.dirname(self.transcript), exist_ok=True)
+        self._ask_n = 0
         self.env.pop("AQDLC_PROJECT", None)
         self.agent_ids = {}
         if git:
@@ -104,8 +110,13 @@ class Env:
             f.write(textwrap.dedent(text))
         return None
 
+    def _tx(self, obj):
+        with open(self.transcript, "a", encoding="utf-8") as f:
+            f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+
     def human_says(self, text="はい、それで進めてください"):
-        self.hook("user-prompt", {"prompt": text})
+        self._tx({"type": "user", "message": {"role": "user", "content": text}})
+        self.hook("user-prompt", {"prompt": text, "transcript_path": self.transcript})
 
     def spec_target(self):
         import re
@@ -121,8 +132,15 @@ class Env:
         return self.aq("spec", "--approve", note)
 
     def human_answers(self, answers):
+        self._ask_n += 1
+        tid = f"toolu_ask{self._ask_n}"
+        self._tx({"type": "assistant", "message": {"role": "assistant", "content": [
+            {"type": "tool_use", "id": tid, "name": "AskUserQuestion", "input": {"questions": []}}]}})
+        text = "User has answered your questions: " + ", ".join(f'"{k}"="{v}"' for k, v in answers.items()) + "."
+        self._tx({"type": "user", "message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": tid, "content": text}]}, "toolUseResult": {"answers": answers}})
         self.hook("post-ask", {"tool_name": "AskUserQuestion", "tool_input": {"questions": []},
-                               "tool_response": {"answers": answers}})
+                               "tool_response": {"answers": answers}, "transcript_path": self.transcript})
 
     # ------------------------------------------------------------ state
     @property

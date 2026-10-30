@@ -1202,9 +1202,16 @@ def hook_context(payload):
     project = active_project_for(cwd)
     state, spath = (load_state(project) if project else (None, None))
     tp = payload.get("transcript_path")
-    if state and tp and not payload.get("agent_type") and state.get("session_transcript") != tp:
-        state["session_transcript"] = tp  # 統括の会話記録（トークンの集計に使う）
-        save_state(spath, state)
+    if state and tp and not payload.get("agent_type"):
+        changed = False
+        if state.get("session_transcript") != tp:
+            state["session_transcript"] = tp  # 統括の会話記録（トークンの集計に使う）
+            changed = True
+        if AP.trusted_transcript(tp) and tp not in state.setdefault("transcripts", []):
+            state["transcripts"] = (state["transcripts"] + [tp])[-10:]  # 人間の返答の照合に使う
+            changed = True
+        if changed:
+            save_state(spath, state)
     return cwd, project, state, spath
 
 
@@ -1383,6 +1390,30 @@ def _check_forged_human(project, payload):
     ms = state.get("memory_scope") or {}
     if ms.get("event_seq") in seqs or (ms.get("seq", 0) > pre["seq"] and ms.get("source") in ("approval", "user_reply")):
         state.pop("memory_scope", None)
+    # 取り消せる操作は元に戻す（設定の受け入れ・等価の除外・共通 Memory への共有）
+    for h in reversed(state.get("history", [])):
+        if h.get("action") == "config.accept" and h.get("seq", 0) > pre["seq"] and \
+                AP.target_id("CFG", (h.get("detail") or {}).get("after")) in revoked:
+            state["config_fp_registered"] = h["detail"].get("before")
+    cfst = state.get("counterfactual") or {}
+    for k, v in list((cfst.get("equivalent") or {}).items()):
+        if v.get("approval") in revoked:
+            cfst["equivalent"].pop(k)
+    for m in ((cfst.get("latest") or {}).get("mutations") or []):
+        if (m.get("equivalent") or {}).get("approval") in revoked:
+            m.pop("equivalent")
+    for sid, sh in ((state.get("memory") or {}).get("share") or {}).items():
+        if sid in revoked and sh.get("status") == "shared" and sh.get("dest"):
+            from .project import home as _home
+            q = os.path.join(_home(), "memory-quarantine", os.path.basename(sh["dest"]) + f".{sid}")
+            try:
+                os.makedirs(os.path.dirname(q), exist_ok=True)
+                shutil.move(sh["dest"], q)
+            except OSError:
+                pass
+            sh.update(status="revoked", quarantined=q)
+            AP.audit_append(os.path.join(_home(), "memory", "audit.jsonl"), "memory.share.revoked", share=sid,
+                            quarantined=q)
     from .state import iter_verifications as _iv
     for _r, _p, v in _iv(state):
         if v.get("confirmed_by") == "human" and f"VERIFY-{v['id']}" in revoked:
@@ -1576,6 +1607,9 @@ def _audit_hook(name, payload, why):
                     cwd=str((payload or {}).get("cwd", ""))[:300], tool=str((payload or {}).get("tool_name", "")))
 
 
+RECOVERY_CMD = re.compile(r"^\s*(\S*python3?\S*\s+)?[\"']?\S*aqdlc\.py[\"']?\s+(new|status|doctor|audit)\b[^;&|`$()<>]*$")
+
+
 def run_hook(name):
     payload = read_payload()
     fn = HOOKS.get(name)
@@ -1604,6 +1638,9 @@ def run_hook(name):
         raise
     except Exception as e:  # noqa: BLE001
         _audit_hook(name, payload, e)
+        if name == "pre-bash" and isinstance(e, StateError) and RECOVERY_CMD.match(
+                (payload.get("tool_input") or {}).get("command", "") or ""):
+            return  # 状態を読めないときの復旧（new --force・status・doctor・audit）だけは許可する
         if name == "post-bash":
             _record_hook_error(payload, e)
             return

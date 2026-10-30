@@ -38,8 +38,8 @@ def phrase(target, decision="承認"):
 # ------------------------------------------------------------------ 返答からの決定の読み取り
 _SEG_SPLIT = re.compile(r"[\n,、;；]")
 ANY_DECISION = re.compile(r"(承認|却下|approve|reject)\s*[:：]?\s*[A-Za-z]+-[A-Za-z0-9_.@-]+", re.I)
-NEGATIVE = re.compile(r"承認しない|承認できない|承認せず|却下|修正したい|修正して|直して|やめ|見送|保留|待って|不可|反対|"
-                      r"\bnot\b|\bno\b|reject|don't|do not", re.I)
+NEGATIVE = re.compile(r"承認しない|承認できない|承認せず|却下|修正したい|修正して|直して|やめて|やめる|見送|保留|反対|"
+                      r"\bdo not approve\b|\bdon't approve\b|\breject", re.I)
 
 
 def decisions_in(text, target):
@@ -87,6 +87,8 @@ def decisions_in(text, target):
 def find_decision(state, target, after_seq):
     """after_seq より後の人間の返答（解析できたもの）から、target への決定を探す。
 
+    E-AQDL の run では、返答が Claude Code の会話記録（transcript）に人間の発言・AskUserQuestion の回答として
+    実際にあることも確かめる（hook を Bash から呼んで返答を記録する偽装を受け付けないため）。
     戻り値: (decision, event, flags)。新しい返答を優先する。
     """
     events = [e for e in state.get("human_events", [])
@@ -94,8 +96,98 @@ def find_decision(state, target, after_seq):
     for e in reversed(events):
         d, flags = decisions_in(e.get("text", ""), target)
         if d:
+            if state.get("eaqdl") and not in_transcript(state, e):
+                continue
             return d, e, flags
     return None, None, set()
+
+
+# ------------------------------------------------------------------ 会話記録（transcript）との照合
+def claude_dirs():
+    out = [os.path.join(os.path.expanduser("~"), ".claude")]
+    if os.environ.get("CLAUDE_CONFIG_DIR"):
+        out.insert(0, os.environ["CLAUDE_CONFIG_DIR"])
+    return [os.path.realpath(d) for d in out]
+
+
+def trusted_transcript(path):
+    """Claude Code の会話記録として扱える場所か（設定フォルダの projects の下の .jsonl。サブエージェントのものは除く）。"""
+    if not path or not str(path).endswith(".jsonl") or not os.path.isfile(path):
+        return False
+    real = os.path.realpath(path)
+    if os.sep + "subagents" + os.sep in real:
+        return False
+    for d in claude_dirs():
+        root = os.path.join(d, "projects") + os.sep
+        if real.startswith(root):
+            return True
+    return False
+
+
+_TX_CACHE = {}
+
+
+def transcript_human(path):
+    """会話記録から、人間の発言と AskUserQuestion の回答のテキストを取り出す。"""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return []
+    key = (path, st.st_size, st.st_mtime_ns)
+    if key in _TX_CACHE:
+        return _TX_CACHE[key]
+    texts, ask_ids = [], set()
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for ln in f:
+                try:
+                    o = json.loads(ln)
+                except ValueError:
+                    continue
+                msg = o.get("message") or {}
+                content = msg.get("content")
+                if o.get("type") == "assistant" and isinstance(content, list):
+                    for b in content:
+                        if isinstance(b, dict) and b.get("type") == "tool_use" and b.get("name") == "AskUserQuestion":
+                            ask_ids.add(b.get("id"))
+                    continue
+                if o.get("type") != "user" or o.get("isMeta") or o.get("isSidechain"):
+                    continue
+                if isinstance(content, str):
+                    texts.append(content)
+                elif isinstance(content, list):
+                    for b in content:
+                        if not isinstance(b, dict):
+                            continue
+                        if b.get("type") == "text" and "toolUseResult" not in o:
+                            texts.append(b.get("text", ""))
+                        elif b.get("type") == "tool_result" and b.get("tool_use_id") in ask_ids:
+                            t, ok = parse_ask_response(o.get("toolUseResult") or b.get("content"))
+                            if ok:
+                                texts.append(t)
+    except OSError:
+        return []
+    _TX_CACHE.clear()
+    _TX_CACHE[key] = texts
+    return texts
+
+
+def _norm(t):
+    return re.sub(r"\s+", " ", t or "").strip()
+
+
+def in_transcript(state, event):
+    """返答が、記録された会話記録に人間の発言・回答として実際にあるか。"""
+    want = [_norm(x) for x in (event.get("text") or "").split("\n") if _norm(x)]
+    if not want:
+        return False
+    for path in state.get("transcripts", []):
+        if not trusted_transcript(path):
+            continue
+        hay = [_norm(t) for t in transcript_human(path)]
+        if all(any(w in h for h in hay) for w in want):
+            return True
+    return False
 
 
 def record(state, target, decision, event, run_dir=None, note="", kind=""):

@@ -401,7 +401,10 @@ def run_cmd_env(cmd, cwd, timeout, env):
     try:
         out, _ = p.communicate(timeout=timeout)
         return p.returncode, decode(out), round(time.time() - start, 2)
-    except subprocess.TimeoutExpired:
+    except BaseException as e:  # noqa: BLE001  中断（Ctrl-C・SIGTERM）でも子孫のプロセスを止める
+        if not isinstance(e, subprocess.TimeoutExpired):
+            _kill_tree(p)
+            raise
         _kill_tree(p)
         try:
             p.communicate(timeout=10)
@@ -538,7 +541,7 @@ def execute(project, state, cfg, muts, log_dir, stamp, only=None):
             write_text(log, f"# {m['id']} {m['operator']} {m['file']}:{m['line']}\n- {m['original']}\n+ {m['mutated']}\n\n"
                        + mask(out, removed_env))
             rec["mutations"].append(m)
-            print(f"  {m['id']} {res:9} {m['file']}:{m['line']} {m['category']}（{vid}）")
+            _say(f"  {m['id']} {res:9} {m['file']}:{m['line']} {m['category']}（{vid}）")
         # 終了時にベースラインをもう一度確かめる（環境の不調で killed になったものを除くため）
         for vid, base in baselines.items():
             if not base["pass"] or not any(x["verification"] == vid and x["result"] == "killed" for x in rec["mutations"]):
@@ -569,6 +572,14 @@ def execute(project, state, cfg, muts, log_dir, stamp, only=None):
                             + G.describe_diff(before, after))
     rec["code_fp"] = G.code_fp(before)
     return rec
+
+
+def _say(msg):
+    try:
+        print(msg)
+    except UnicodeEncodeError:
+        enc = getattr(sys.stdout, "encoding", None) or "ascii"
+        print(msg.encode(enc, errors="replace").decode(enc, errors="replace"))
 
 
 def _clear_pycache(sandbox, rel):

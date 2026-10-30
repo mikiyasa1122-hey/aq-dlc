@@ -103,7 +103,8 @@ def load_state(project):
     if not isinstance(s, dict) or not s.get("run_id"):
         # CURRENT が指す run の状態を読めない（削除・空・形式違い）。読めないまま許可しないよう異常として扱う
         raise StateError(f"run の状態（{p}）を読めません（削除・空・形式の違い）。人間に確認してください。"
-                         "やり直す場合は new --force で新しい run を始めます。")
+                         "やり直す場合は new --force で新しい run を始めます（このコマンドと status・doctor・audit は"
+                         "エージェントからも実行できます。ほかの操作は止まります）。")
     s = migrate(s)
     s["_rev"] = int(s.get("rev", 0) or 0)
     return s, p

@@ -58,7 +58,7 @@
 | 条件 | 内容 |
 |---|---|
 | Memory の利用範囲 | run の開始時に `memory-scope none|project|all`。未選択の間は設計・実装・レビューに進めず、共通 Memory も読まない。`all` は「承認 MEMSCOPE-…」か設定が必要 |
-| 承認の対象 | 仕様・設定・人の確認・Memory の利用と共有・等価な変異の除外は、対象 ID（SPEC- / CFG- / 検証ID / MEMSCOPE- / SHARE- / MEM- / EQ-）と決定（承認・却下）を1行で書いた人間の返答だけを決定とする。承認は対象・決定・時刻・run・元の返答と一緒に state と監査ログ（runs/<run>/audit.jsonl）に残る |
+| 承認の対象 | 仕様・設定・人の確認・Memory の利用と共有・等価な変異の除外は、対象 ID（SPEC- / CFG- / 検証ID / MEMSCOPE- / SHARE- / MEM- / EQ-）と決定（承認・却下）を1行で書いた人間の返答だけを決定とする。返答は Claude Code の会話記録にある人間の発言・AskUserQuestion の回答と照合する（hook を Bash から呼んだ返答は使わない）。承認は対象・決定・時刻・run・元の返答と一緒に state と監査ログ（runs/<run>/audit.jsonl）に残る |
 | 状態の整合性 | state.json の保存時にスキーマ・状態・参照 ID・gate とレビューと承認の整合性を確かめ、新たな矛盾を持ち込む保存と、読み込み後の同時更新を拒否する。既に壊れていれば `state_invalid` として人間に知らせ、先に進めない |
 | Hook の異常 | 重要な PreToolUse（Bash・Write/Edit・Agent）の判定でエラー・入力の読み取り失敗・状態の読み取り失敗が起きたら、E-AQDL のプロジェクトでは拒否する（~/.aq-dlc/audit.jsonl に記録） |
 | 反証テスト | advisory / enforce では gate の後に `cf` が必要。enforce では、重要な要求の検証が欠陥を見逃す（survived）か反証が成立しない（invalid / timeout のみ）とレビュー・完了に進めない |

@@ -38,6 +38,12 @@ class TestOperators(unittest.TestCase):
         self.assertIsNone(self.ap("negate_if", 'def f():\n    """\n    if the user is admin:\n    """\n', 2))
         self.assertIsNone(self.ap("eq_flip", "let a = 1; // a == b\n", lang="js"))
         self.assertIsNone(self.ap("sql_where", "// UPDATE t SET x=1 WHERE a = 1 AND b = 2\n", lang="js"))
+        # 三重引用符の中の SQL は対象にする。マスクは内容で決まる（別のファイルの結果を取り違えない）
+        sql = 'q = """\n  UPDATE t SET x = 1\n  WHERE id = ? AND owner = ?\n"""\n'
+        self.assertIn("OR owner", self.ap("sql_where", sql, 2))
+        for _ in range(300):
+            self.assertIsNotNone(self.ap("and_or", "if a and b:\n    pass\n"))
+            self.assertIsNone(self.ap("and_or", '"""\nif a and b:\n"""\n', 1))
 
     def test_js_operators(self):
         js = "  if (!user || user.role !== 'admin') { throw new Error('forbidden'); }\n"

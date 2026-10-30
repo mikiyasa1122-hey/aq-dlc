@@ -83,7 +83,7 @@ _MASK_CACHE = {}
 
 def masked_lines(lines, lang):
     """複数行の文字列（docstring）・ブロックコメントの中にある行の番号の集合。"""
-    key = (id(lines), len(lines), lang)
+    key = (lang, hash(tuple(lines)))
     if key in _MASK_CACHE:
         return _MASK_CACHE[key]
     out, inside = set(), None
@@ -171,8 +171,10 @@ def apply(op, lines, i, lang):
     if i < 0 or i >= len(lines):
         return None
     line = lines[i]
-    if _skip_line(line, lang) or i in masked_lines(lines, lang):
+    if _skip_line(line, lang):
         return None
+    if i in masked_lines(lines, lang) and not (op == "sql_where" and lang == "python"):
+        return None  # docstring・ブロックコメント（Python の三重引用符の SQL 文字列だけは対象にする）
     nl = "\n" if line.endswith("\n") else ""
     body = line[:-1] if nl else line
     new = None
@@ -250,7 +252,8 @@ def apply(op, lines, i, lang):
         if m and m.group(1) in pairs:
             new = body[:m.start(1)] + pairs[m.group(1)] + body[m.end(1):]
     elif op == "sql_where":
-        if re.search(r"\b(UPDATE|DELETE)\b", body, re.I) and re.search(r"\bWHERE\b", body, re.I):
+        ctx = "".join(lines[max(0, i - 5):i]) + body  # 複数行の SQL（直前の数行に UPDATE / DELETE）
+        if re.search(r"\b(UPDATE|DELETE)\b", ctx, re.I) and re.search(r"\bWHERE\b", body, re.I):
             m = re.search(r"(?<=\s)AND(?=\s)", body[re.search(r"\bWHERE\b", body, re.I).end():], re.I)
             if m:
                 off = re.search(r"\bWHERE\b", body, re.I).end()
