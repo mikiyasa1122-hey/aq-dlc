@@ -22,7 +22,7 @@
 **互換性**: 改名は表示（README・プラグインの表示名・Skill と Agent の説明・CLI の表示）だけです。次はそのまま使えます。
 - プラグイン ID `aq-dlc`、インストール名 `aq-dlc@aq-dlc`、エージェント ID `aq-dlc:requirements|design|implementer|reviewer`、Skill `/aq-dlc:start` `/aq-dlc:memory`
 - エンジン `scripts/aqdlc.py` とすべての従来のコマンド、`~/.aq-dlc/`、`<project>/.aq-dlc/`、既存の run・設定・Memory
-- GitHub リポジトリ名（`aq-dlc`）は変更していません（変更する場合は人間が行います）
+- GitHub リポジトリは人間が `mikiyasa1122-hey/e-aqdl` に改名しました（旧 URL `mikiyasa1122-hey/aq-dlc` は GitHub が転送します）。マーケットプレイス名とプラグイン ID は `aq-dlc` のままです
 
 ## 体制
 
@@ -160,7 +160,7 @@ hook だけで任意のシェル操作を完全に封じることはできませ
 必要なもの：Claude Code、Python 3.8 以上、git。GitHub 連携を使うなら `gh`（`gh auth login` 済み）。
 
 ```
-/plugin marketplace add mikiyasa1122-hey/aq-dlc
+/plugin marketplace add mikiyasa1122-hey/e-aqdl
 /plugin install aq-dlc@aq-dlc
 ```
 
