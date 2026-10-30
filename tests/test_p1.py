@@ -82,8 +82,11 @@ class MemoryReliabilityTest(unittest.TestCase):
         self.e = Env()
         self.e.aq("init", "x")
         self.e.aq("new", "x")
+        self.e.aq("memory-scope", "project")
         self.run_id = self.e.state()["run_id"]
-        self.mem_dir = os.path.join(self.e.home, "memory", "success")
+        # E-AQDL: 保存はプロジェクトの Memory（共通 Memory へは memory-share で人間の承認を得て共有する）
+        self.mem_dir = os.path.join(self.e.project, ".aq-dlc", "memory", "success")
+        os.makedirs(self.mem_dir, exist_ok=True)
 
     def tearDown(self):
         self.e.cleanup()
@@ -95,48 +98,59 @@ class MemoryReliabilityTest(unittest.TestCase):
             applied=applied, extra=extra, title=title or f"題名 {mid}"))
 
     def test_memory_done_requires_a_report(self):
-        out = self.e.aq("memory-done", ok=False)
+        out = self.e.aq("memory-done", "--end", "project", ok=False)
         self.assertIn("--skipped", out)
-        self.e.aq("memory-done", "--skipped", "再利用できる学びがなかった")
+        self.e.aq("memory-done", "--end", "project", "--skipped", "再利用できる学びがなかった")
         s = self.e.state()
         self.assertTrue(s["memory_done"])
         self.assertEqual(s["memory"]["report"]["skipped"], "再利用できる学びがなかった")
 
     def test_saved_memory_must_exist_and_cite_this_run(self):
-        self.e.aq("memory-done", "--saved", "W-0100", ok=False)  # 存在しない
+        self.e.aq("memory-done", "--end", "project", "--saved", "W-0100", ok=False)  # 存在しない
         self.write_mem("W-0100", evidence="other/runs/old#V1")
-        out = self.e.aq("memory-done", "--saved", "W-0100", ok=False)
+        out = self.e.aq("memory-done", "--end", "project", "--saved", "W-0100", ok=False)
         self.assertIn("この run", out)
         self.write_mem("W-0100")
-        self.e.aq("memory-done", "--saved", "W-0100")
+        self.e.aq("memory-done", "--end", "project", "--saved", "W-0100")
 
     def test_unverified_memory_cannot_be_active(self):
         self.write_mem("W-0101", status="active")
-        out = self.e.aq("memory-done", "--saved", "W-0101", ok=False)
-        self.assertIn("未検証", out)
+        out = self.e.aq("memory-done", "--end", "project", "--saved", "W-0101", ok=False)
+        self.assertIn("根拠を確認できない", out)  # 実在する検証・gate の合格がない
+        self.assertIn("役立った記録", out)  # 根拠の run 以外での helped が足りない
         self.write_mem("W-0102", status="active", typ="rule", applied="a, b, c")
-        out = self.e.aq("memory-done", "--saved", "W-0102", ok=False)
+        out = self.e.aq("memory-done", "--end", "project", "--saved", "W-0102", ok=False)
         self.assertIn("人間の承認", out)
 
     def test_duplicate_title_must_be_merged(self):
         self.write_mem("W-0103", title="同じ題名")
         self.write_mem("W-0104", title="同じ題名")
-        out = self.e.aq("memory-done", "--saved", "W-0104", ok=False)
+        out = self.e.aq("memory-done", "--end", "project", "--saved", "W-0104", ok=False)
         self.assertIn("統合", out)
 
+    def use_common(self):
+        """読み込みの検査は共通 Memory で行う（プロジェクトの Memory は根拠を照合できないと未検証として扱うため）。"""
+        self.mem_dir = os.path.join(self.e.home, "memory", "success")
+        os.makedirs(self.mem_dir, exist_ok=True)
+        s = self.e.state()
+        s["memory_scope"] = {"choice": "all", "source": "config", "seq": s["seq"]}
+        self.e.save_state(s)
+
     def test_loaded_memory_needs_a_result(self):
+        self.use_common()
         self.write_mem("W-0105", status="validated")
         out = self.e.aq("memory", "--tags", "workflow", "--record")
         self.assertIn("W-0105", out)
         self.assertIn("W-0105", self.e.state()["memory"]["loaded"])
-        out = self.e.aq("memory-done", "--skipped", "なし", ok=False)
+        out = self.e.aq("memory-done", "--end", "project", "--skipped", "なし", ok=False)
         self.assertIn("memory-use", out)
         self.e.aq("memory-use", "W-0105", "--result", "bogus", ok=False)
         self.e.aq("memory-use", "W-0105", "--result", "helped", "--note", "境界値の洗い出しに使えた")
-        self.e.aq("memory-done", "--skipped", "なし")
+        self.e.aq("memory-done", "--end", "project", "--skipped", "なし")
         self.assertEqual(self.e.state()["memory"]["used"]["W-0105"]["result"], "helped")
 
     def test_listing_respects_limit(self):
+        self.use_common()
         for i in range(30):
             self.write_mem(f"W-02{i:02d}", status="validated")
         out = self.e.aq("memory", "--tags", "workflow")
@@ -171,6 +185,7 @@ class MetricsTest(unittest.TestCase):
         try:
             e.aq("init", "x")
             e.aq("new", "x")
+            e.aq("memory-scope", "project")
             tp = os.path.join(e.tmp, "t.jsonl")
             write_file(tp, "\n".join(json.dumps(x) for x in [
                 {"type": "assistant", "message": {"id": "m1", "usage": {"input_tokens": 10, "output_tokens": 5}}},

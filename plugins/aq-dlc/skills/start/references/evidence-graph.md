@@ -43,3 +43,23 @@ gate は次の指紋と一緒に結果を記録し、どれかが変わると結
 ## 人の確認とマージ後の検証
 - 人にしか確かめられないもの: `verify ... --manual "<手順>"`。`ask` → 人間の返答 → `confirm <ID> "<返答の要約>"`。
 - マージ後にしか確かめられないもの: `--after-merge`。PR 前の判定から外れ、マージ後に `gate --after-merge`（自動）または confirm（人の確認）。
+
+## Negative Evidence Graph（`evidence` / `trace`）
+
+検証（V）ごとに、通常の Quality Gate・反証テスト・独立レビューを別の層として記録し、総合の状態を示す。通常の gate の合格を「欠陥を検出できることの証明」とは扱わない。
+
+| 状態 | 意味 |
+|---|---|
+| verified | 検証の契約を満たす証拠がある（通常 Gate 合格＋反証テストで欠陥を検出、または対象を指定した人間の確認） |
+| passed_but_unchallenged | 通常 Gate は合格。反証テストは未実施（mode: off・未実行） |
+| insufficient | 証拠が不足（未実行・不合格・実行方法なし・人の確認待ち・欠陥の見逃し・反証が不成立） |
+| invalidated | 変更で失効（原因: コード・チェック・設定・その検証の条件・反証テスト後の Mutation の定義など） |
+| not_applicable | 通常 Gate は合格。反証テストを適用できる箇所がない（対応外の言語など） |
+
+受け入れ条件・リスクの状態は、その検証の中で最も弱い状態（検証がなければ insufficient）。
+
+失効は依存関係に従う: コード・チェックの定義・設定の変更はすべての検証を、検証条件の変更はその検証だけを失効させる。反証テストの結果は、コード・チェック・検証条件・Mutation の定義（対象・Operator・元の行）・実行環境の指紋に紐付く。独立レビューは、レビュー担当の Role Profile の版と反証テストの結果にも紐付く。
+
+## 反証テスト（Counterfactual Gate）の記録
+
+`runs/<run>/cf/` に Mutation ごとのログ、state の `counterfactual.latest` に、Mutation ID・要求・リスク・検証 ID・Operator・分類・対象ファイルと行・元の行と変更後の行・期待する失敗・結果と理由・コマンド・時間・再現方法（`cf --only M3`）を残す。検出率は「killed ÷（killed＋survived）」。invalid・timeout・対象外・等価として除外したものは母集団に入れず、件数を別に示す。

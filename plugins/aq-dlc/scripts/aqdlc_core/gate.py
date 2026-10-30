@@ -159,8 +159,11 @@ def config_fp(cfg, project=None):
 
     指紋の対象・自動化の境界・hook の無効化などの改ざんを検出する。
     """
-    return fingerprint({"cfg": {k: v for k, v in cfg.items() if not k.startswith("_")},
-                        "claude": protected_files_fp(project) if project else None})
+    from .project import DEFAULTS, EAQDL_SECTIONS
+    # E-AQDL で追加した設定は、既定値のままなら含めない（更新前に始まった run の指紋を変えないため）
+    eff = {k: v for k, v in cfg.items() if not k.startswith("_")
+           and not (k in EAQDL_SECTIONS and v == DEFAULTS.get(k))}
+    return fingerprint({"cfg": eff, "claude": protected_files_fp(project) if project else None})
 
 
 def verification_fp(v, cfg):

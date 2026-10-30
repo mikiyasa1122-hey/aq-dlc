@@ -11,7 +11,7 @@ from test_p0 import MAJOR, MINOR, review  # noqa: E402
 
 
 def finish(e):
-    e.aq("memory-done", "--skipped", "テスト用の run")
+    e.aq("memory-done", "--end", "project", "--skipped", "テスト用の run")
 
 
 class VerdictParsingTest(unittest.TestCase):
@@ -177,9 +177,12 @@ class ConfigTamperTest(unittest.TestCase):
             res = e.hook("pre-write", {"tool_name": "Write", "tool_input": {
                 "file_path": os.path.join(e.home, "config.json"), "content": "{}"}, **e.agent_fields(role)})
             self.assertTrue(denied(res), role)
-        # Memory は統括だけが書ける
+        # E-AQDL: 共通 Memory へは統括も直接書けない（memory-share で候補ごとに人間の承認を得る）
         res = e.hook("pre-write", {"tool_name": "Write", "tool_input": {
             "file_path": os.path.join(e.home, "memory", "success", "W-9.md"), "content": "x"}})
+        self.assertTrue(denied(res))
+        res = e.hook("pre-write", {"tool_name": "Write", "tool_input": {
+            "file_path": os.path.join(e.project, ".aq-dlc", "memory", "success", "W-9.md"), "content": "x"}})
         self.assertFalse(denied(res))
 
     def test_agent_definition_impersonation(self):
@@ -204,6 +207,7 @@ class ViolationTest(unittest.TestCase):
         self.e = e = Env()
         e.aq("init", "x")
         e.aq("new", "x")
+        e.aq("memory-scope", "project")
         os.makedirs(os.path.join(e.project, "src"), exist_ok=True)
         bash_as(e, "orchestrator", "echo 'x = 1' > src/early.py")
         self.assertTrue(e.state()["violations"])
@@ -354,9 +358,7 @@ def build_rest(e):
     e.as_role("requirements", "verify", "AC2", "V3", "全体", "--level", "unit")
     e.write_as("requirements", os.path.relpath(os.path.join(e.arts, "spec.md"), e.project), helpers.SPEC_MD)
     assert e.stop("requirements", "") is None
-    e.aq("spec", "--present")
-    e.human_says("承認します")
-    e.aq("spec", "--approve", "承認")
+    e.approve_spec("承認")
     e.spawn("design")
     e.start("design")
     e.as_role("design", "design-map", "R1", "src/memo.py")

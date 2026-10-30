@@ -58,6 +58,15 @@ DEFAULTS = {
         "block_pr_merge": True,
         "block_destructive_gh": True,
     },
+    # --- E-AQDL で追加した設定（既定値のままなら設定の指紋に含めない: 既存の run の互換のため）
+    "roles": {"enabled": True, "max_domain_profiles": 3, "disabled": []},
+    "counterfactual": {"mode": "off", "timeout_sec": 300, "max_mutations": 12, "per_verification": 2,
+                       "auto_plan": True, "copy_extra": []},
+    "memory_policy": {
+        # run の開始時の Memory の利用範囲: ask（人間に聞く）/ none / project / all
+        "scope_default": "ask",
+        # 終了時に共通 Memory へ共有するときは、候補ごとに人間の承認が必要（変更できない）
+    },
     "memory": {
         "max_loaded_per_run": 10,
         "auto_save_min_score": 3,
@@ -74,7 +83,7 @@ def ensure_home(verbose=False):
     cfg_path = os.path.join(h, "config.json")
     if not os.path.exists(cfg_path):
         save_json(cfg_path, {
-            "_note": "AQ-DLC の全体設定。プロジェクトごとの設定は <project>/.aq-dlc/config.json で上書きできる。",
+            "_note": "E-AQDL の全体設定。プロジェクトごとの設定は <project>/.aq-dlc/config.json で上書きできる。",
             "workspace_dir": "",
             "github": DEFAULTS["github"],
             "automation": DEFAULTS["automation"],
@@ -97,6 +106,9 @@ def ensure_home(verbose=False):
             print(f"  + {c}")
         if not created:
             print("  （既に初期化済み）")
+
+
+EAQDL_SECTIONS = ("roles", "counterfactual", "memory_policy")
 
 
 def config(project=None):
@@ -127,7 +139,7 @@ def resolve_project(args, required=True):
     if p:
         p = os.path.abspath(os.path.expanduser(p))
         if not os.path.isfile(os.path.join(p, ".aq-dlc", "project.json")):
-            die(f"AQ-DLC プロジェクトではありません: {p}（init で初期化してください）")
+            die(f"E-AQDL プロジェクトではありません: {p}（init で初期化してください）")
         return p
     p = find_project(os.getcwd())
     if p or not required:
@@ -222,7 +234,7 @@ def cmd_init(args):
         print(target)
         return
     if existing:
-        die(f"既存のAQ-DLCプロジェクトの内側です: {existing}")
+        die(f"既存のE-AQDLプロジェクトの内側です: {existing}")
     name = " ".join(args).strip() or os.path.basename(target)
     others = [e for e in os.listdir(target) if not e.startswith(".")]
     added, kept = scaffold(target, name)
@@ -255,7 +267,7 @@ def cmd_create(args):
     if os.path.exists(target) and os.listdir(target):
         die(f"既に存在し、空ではありません: {target}（別の名前にするか --parent を指定）")
     if find_project(parent):
-        die(f"既存のAQ-DLCプロジェクトの内側には作れません: {find_project(parent)}")
+        die(f"既存のE-AQDLプロジェクトの内側には作れません: {find_project(parent)}")
     os.makedirs(target, exist_ok=True)
     scaffold(target, name)
     print(target)

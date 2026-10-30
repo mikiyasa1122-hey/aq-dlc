@@ -11,6 +11,8 @@ import shutil
 import time
 
 from . import gate as G
+from . import counterfactual as CF
+from . import roles as RL
 from .project import config, engine_cmd
 from .state import (ROLES, ROLE_LABEL, Ctx, artifacts_dir, bump, doc_hash, doc_path, gate_status, open_violations,
                     current_review, graph_issues, id_index, iter_verifications, last_impl, latest_review, problems,
@@ -121,9 +123,26 @@ def pending_fix(ctx):
         kind = kind or ("review", rv["n"])
         items += [f for f in rv.get("findings", []) if f.get("severity") == "重大"] or rv.get("findings", [])
     if kind:
+        if kind[0] == "unowned":  # 担当外の変更の後の gate の不合格も合わせて伝える
+            items += [dict(f, info=True) for f in _gate_items(s, li)[1]]  # 参考（対応の記載は必須にしない）
         return kind, items
+    crec = CF.current(s)
+    if crec and CF.cf_config(ctx.cfg)["mode"] == "enforce" and crec.get("status") == "done" \
+            and (not li or li["seq"] < crec.get("seq", 0)):
+        surv = [m for v, _w, ids in CF.critical_gaps(s, crec) for m in crec["mutations"] if m["id"] in ids]
+        if surv:
+            return ("counterfactual", crec["stamp"]), [
+                {"label": f"反証{m['id']}", "text": f"{m['id']}（{m['verification']} / {m.get('risk') or m['parent']}）: "
+                 f"{m['file']}:{m['line']} に「{m['category']}」の欠陥（`{m['original'].strip()}` → "
+                 f"`{m['mutated'].strip()}`）を入れてもテストが通過した。この欠陥で失敗するようにテストを強化する"
+                 "（実装を変えて見逃しを隠さない）"} for m in surv]
+    return _gate_items(s, li)
+
+
+def _gate_items(s, li):
+    kind, items = None, []
     g = s.get("gate")
-    if not kind and g and (not li or li["seq"] < g["seq"]):
+    if g and (not li or li["seq"] < g["seq"]):
         failed = [(n, r) for n, r in g["results"]["checks"].items() if not r["pass"]]
         vfail = [(n, r) for n, r in g["results"]["verifications"].items()
                  if not r.get("pass") and not r.get("pending_after_merge") and not r.get("manual")]
@@ -139,11 +158,22 @@ def pending_fix(ctx):
 
 
 # ------------------------------------------------------------------ briefs
-def brief(role, ctx, entry=None):
+def role_selection(role, ctx, kind=None, prompt=""):
+    """この担当に今回適用する Role Profile（決定論的）。kind は pending_fix の種類。"""
+    extra = []
+    mode = (ctx.cfg.get("counterfactual") or {}).get("mode", "off")
+    if role == "reviewer" and mode in ("advisory", "enforce"):
+        extra.append("adversarial-tester")
+    if role == "implementer" and kind and kind[0] == "counterfactual":
+        extra.append("adversarial-tester")
+    return RL.select(role, ctx.state, ctx.cfg, prompt=prompt, extra_stage=extra)
+
+
+def brief(role, ctx, entry=None, sel=None):
     s, project, rd = ctx.state, ctx.project, ctx.rd
     aq = f'{engine_cmd()} <コマンド> --project "{project}"'
     head = [
-        f"【AQ-DLC 引き継ぎ情報】あなたは AQ-DLC の {ROLE_LABEL[role]} です。",
+        f"【E-AQDL 引き継ぎ情報】あなたは E-AQDL の {ROLE_LABEL[role]} です。",
         f"- プロジェクト: {project}",
         f"- run: {s['run_id']}（{s.get('title')}）",
         f"- エンジン: {aq}  （以下 $AQ と書く。必ず --project を付ける）",
@@ -157,6 +187,8 @@ def brief(role, ctx, entry=None):
     body = globals()[f"_brief_{role}"](ctx)
     if role == "reviewer" and entry:
         body += _reviewer_extra(ctx, entry)
+    if sel:
+        body += RL.brief_section(sel)
     return "\n".join(head + body)
 
 
@@ -276,7 +308,10 @@ def _brief_implementer(ctx):
         "",
     ]
     if kind:
-        what = f"レビュー#{kind[1]} の重大な指摘" if kind[0] == "review" else f"gate {kind[1]} の不合格"
+        what = {"review": f"レビュー#{kind[1]} の重大な指摘", "counterfactual": f"反証テスト {kind[1]} の見逃し",
+                "unowned": "担当外の変更の確認"}.get(kind[0], f"gate {kind[1]} の不合格")
+        if kind[0] == "unowned" and any(not str(f["label"]).startswith("担当外") for f in items):
+            what += "と、その後の gate の不合格"
         lines += [f"## 今回の修正依頼（{what}）"]
         for f in items:
             lines.append(f"- [{f['label']}] {f['text']}")
@@ -291,8 +326,33 @@ def _brief_implementer(ctx):
     return lines
 
 
+def _cf_lines(ctx):
+    cc = CF.cf_config(ctx.cfg)
+    rec = CF.current(ctx.state)
+    if cc["mode"] == "off":
+        return ["", "## 反証テスト（Counterfactual Gate）",
+                "- 無効（counterfactual.mode: off）。通常の gate の合格は「欠陥を検出できることの証明」ではない点に注意する。"]
+    if not rec:
+        return ["", "## 反証テスト（Counterfactual Gate）", "- 未実行"]
+    sm = CF.summarize(rec)
+    c = sm["counts"]
+    lines = ["", f"## 反証テスト（Counterfactual Gate、mode: {cc['mode']}、{rec.get('stamp')}）",
+             f"- killed {c['killed']} / survived {c['survived']} / invalid {c['invalid']} / timeout {c['timeout']}"
+             f" / 対象外 {c['not_applicable']}（検出率 {sm['score'] if sm['score'] is not None else '算出不可'}"
+             f"＝killed ÷（killed＋survived）、除外 {sm['excluded']} 件）"]
+    for m in rec.get("mutations", []):
+        if m.get("result") == "survived" and not m.get("equivalent"):
+            lines.append(f"- survived {m['id']}: {m['file']}:{m['line']} {m['category']}（{m['verification']}）"
+                         f" `{m['original'].strip()}` → `{m['mutated'].strip()}`")
+    if c["survived"]:
+        lines.append("→ survived の各 ID について、テストの不足か等価な変異かを「### 指摘」か「### 確認したこと」に書く"
+                     "（ID を必ず書く）。重要な要求のテスト不足は重大な指摘にする。")
+    return lines
+
+
 def _reviewer_extra(ctx, entry):
-    lines = ["", "## エンジンが機械的に検出したテストの兆候（判断材料。合否はあなたが判断する）"]
+    lines = _cf_lines(ctx)
+    lines += ["", "## エンジンが機械的に検出したテストの兆候（判断材料。合否はあなたが判断する）"]
     sig = entry.get("test_signals") or []
     if sig:
         lines += [f"- {x['file']}: {x['issue']}" for x in sig]
@@ -388,8 +448,11 @@ def spawn_problem(role, ctx):
         return None
     probs = problems(ctx)
     codes = [p["code"] for p in probs]
-    if [p for p in probs if p["code"] == "config_changed"]:
-        return "設定がエンジンのコマンド以外で変更されています。人間の確認（ask → config-accept）が済むまで進めません。"
+    if [p for p in probs if p["code"] == "memory_scope"]:
+        return "Memory の利用範囲が未選択です。先に人間に確認して memory-scope を実行してください。"
+    blk = [p for p in probs if p["code"] in ("config_changed", "state_invalid", "forged_human")]
+    if blk:
+        return blk[0]["msg"] + "。人間の確認が済むまで進めません。"
     spec_block = {"spec_missing", "graph_incomplete", "spec_unregistered", "questions_open",
                   "answers_unapplied", "spec_unpresented", "spec_unapproved", "dup_ids"}
     blocking = [p for p in probs if p["code"] in spec_block]
@@ -411,7 +474,8 @@ def spawn_problem(role, ctx):
         pre = [p for p in probs if p["code"] in ("impl_missing", "impl_stale", "impl_untraced", "verif_unbound",
                                                  "code_unowned", "violation_open", "review_fix", "gate_missing",
                                                  "gate_stale",
-                                                 "gate_fail", "gate_modified")]
+                                                 "gate_fail", "gate_modified", "cf_missing", "cf_stale",
+                                                 "cf_survived", "cf_insufficient")]
         if pre:
             return "Quality Gate を通過した最新の実装がないため、レビューできません: " + pre[0]["msg"]
         return None
@@ -567,6 +631,13 @@ def validate(role, ctx, entry, message):
         e2e = section(message, "E2E の要否")
         if e2e is None or not e2e.strip():
             errs.append("「### E2E の要否」の節がない（必要か・不要ならその理由）")
+        crec = CF.current(s)
+        if crec and CF.cf_config(ctx.cfg)["mode"] != "off":
+            surv = [m["id"] for m in crec.get("mutations", []) if m.get("result") == "survived"
+                    and not m.get("equivalent")]
+            miss = [i for i in surv if not re.search(rf"(?<![A-Za-z0-9]){i}(?![0-9])", message or "")]
+            if miss:
+                errs.append("反証テストで survived になった Mutation に触れていない: " + "、".join(miss[:10]))
         sig = entry.get("test_signals") or []
         unmentioned = [x["file"] for x in sig if x["file"] not in (message or "")]
         if unmentioned:
@@ -584,11 +655,12 @@ def register(role, ctx, entry, message):
         sp["registered_hash"] = ctx.spec_hash
         sp["registered_seq"] = seq
         sp["version"] = int(sp.get("version", 0)) + 1
+        sp["role_fp"] = entry.get("role_fp")
         return f"仕様 v{sp['version']}（{short(ctx.spec_hash)}）を登録"
     if role == "design":
         d = s["design"]
         d.update({"registered_hash": ctx.design_hash, "spec_hash": ctx.spec_hash, "registered_seq": seq,
-                  "version": int(d.get("version", 0)) + 1})
+                  "version": int(d.get("version", 0)) + 1, "role_fp": entry.get("role_fp")})
         _escalate(s, "design", read_text(doc_path(rd, "design")), seq)
         return f"設計 v{d['version']}（{short(ctx.design_hash)}）を登録"
     if role == "implementer":
@@ -599,7 +671,8 @@ def register(role, ctx, entry, message):
             v["resolved"] = {"by_round": n, "seq": seq}
         rec = {"n": n, "seq": seq, "at": now_iso(), "code_fp": ctx.code_fp, "snapshot": ctx.snap,
                "config_fp": ctx.config_fp, "design_hash": ctx.design_hash,
-               "spec_hash": ctx.spec_hash, "report_hash": doc_hash(rd, "impl"), "fix": fix or None}
+               "spec_hash": ctx.spec_hash, "report_hash": doc_hash(rd, "impl"), "fix": fix or None,
+               "role_fp": entry.get("role_fp")}
         rounds.append(rec)
         if fix:
             s["fix_iterations"] = int(s.get("fix_iterations", 0)) + 1
@@ -629,6 +702,7 @@ def register(role, ctx, entry, message):
                     "config_fp": ctx.config_fp,
                     "checks_fp": ctx.checks_fp, "spec_hash": ctx.spec_hash, "design_hash": ctx.design_hash,
                     "gate_stamp": (s.get("gate") or {}).get("stamp"), "report": os.path.relpath(path, ctx.project),
+                    "role_fp": entry.get("role_fp"), "cf_fp": entry.get("cf_fp"),
                     "valid": invalid is None, "invalid_reason": invalid})
         s["reviews"].append(rec)
         if invalid:
@@ -655,13 +729,16 @@ def on_pre_agent(payload, project, state, spath):
         return None
     cfg = config(project)
     if not state:
-        return deny("実行中の run がありません。AQ-DLC の開発は new で run を開始してから行います。")
+        return deny("実行中の run がありません。E-AQDL の開発は new で run を開始してから行います。")
     ctx = Ctx(project, state, cfg, fresh=(role == "reviewer"))
     why = spawn_problem(role, ctx)
     if why:
         return deny(why)
+    prompts = state["agents"].setdefault("prompts", {})
+    prompts[role] = str(ti.get("prompt") or "")[:4000]
+    save_state(spath, state)
     out = {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "allow",
-                                  "permissionDecisionReason": f"AQ-DLC: {ROLE_LABEL[role]} を順番に実行します"}}
+                                  "permissionDecisionReason": f"E-AQDL: {ROLE_LABEL[role]} を順番に実行します"}}
     if cfg["automation"].get("force_foreground_agents", True) and ti.get("run_in_background") is not False:
         upd = dict(ti)
         upd["run_in_background"] = False
@@ -683,15 +760,22 @@ def on_subagent_start(payload, project, state, spath):
         files = sorted(ctx.snap)
         signals = G.test_signals(project, files)
         web = G.looks_like_web_app(project, files)
+    prompt = (state["agents"].get("prompts") or {}).get(role, "") if role == "requirements" else ""
+    sel = role_selection(role, ctx, kind, prompt)
+    sendback = bool(kind) or (role in ("requirements", "design") and any(
+        p["code"] in ("review_fix", "escalation") for p in problems(ctx)))
+    rrec = RL.record(state, role, sel, RL.trigger_of(role, state, sendback), state.get("seq", 0), aid)
     entry = {"role": role, "since": now_iso(), "epoch": time.time(), "start_seq": state.get("seq", 0),
              "code_fp_start": ctx.code_fp, "gate_ok_at_start": gate_ok, "blocks": 0,
              "impl_hash_start": doc_hash(ctx.rd, "impl") if role == "implementer" else None,
-             "fix": {"kind": kind[0], "ref": kind[1], "labels": [f["label"] for f in items]} if kind else None,
-             "test_signals": signals, "web_app": web}
+             "fix": {"kind": kind[0], "ref": kind[1], "labels": [f["label"] for f in items if not f.get("info")]} if kind else None,
+             "test_signals": signals, "web_app": web, "role_fp": sel["fp"], "role_trigger": rrec["trigger"],
+             "cf_fp": CF.record_fp(state) if role == "reviewer" else None}
     state["agents"]["running"][aid] = entry
     state["stop_blocks"] = 0
     save_state(spath, state)
-    return {"hookSpecificOutput": {"hookEventName": "SubagentStart", "additionalContext": brief(role, ctx, entry)}}
+    return {"hookSpecificOutput": {"hookEventName": "SubagentStart",
+                                   "additionalContext": brief(role, ctx, entry, sel)}}
 
 
 def on_subagent_stop(payload, project, state, spath):
@@ -713,7 +797,7 @@ def on_subagent_stop(payload, project, state, spath):
         entry["blocks"] = entry.get("blocks", 0) + 1
         running[aid] = entry
         save_state(spath, state)
-        reason = ("AQ-DLC: 成果物が完成していないため、まだ終了できません。次を直してから終えてください:\n- "
+        reason = ("E-AQDL: 成果物が完成していないため、まだ終了できません。次を直してから終えてください:\n- "
                   + "\n- ".join(errs[:10]))
         return {"decision": "block", "reason": reason}
     running.pop(aid, None)
@@ -801,17 +885,18 @@ def _last_message(path):
 
 def deny(reason):
     return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
-                                   "permissionDecisionReason": "AQ-DLC: " + reason}}
+                                   "permissionDecisionReason": "E-AQDL: " + reason}}
 
 
 # ------------------------------------------------------------------ permissions
 ENGINE_RE = re.compile(r"aqdlc\.py[\"']?\s+[\"']?([a-z][a-z-]*)")
-COMMON_READ = {"status", "next", "trace", "history", "show", "spec", "checks", "memory", "check", "escalation",
+COMMON_READ = {"status", "next", "trace", "history", "show", "spec", "checks", "memory", "check", "escalation", "audit",
+               "evidence", "roles",
                "metrics"}
 ROLE_COMMANDS = {
     "requirements": COMMON_READ | {"req", "accept", "risk", "verify", "assume", "question", "drop"},
     "design": COMMON_READ | {"design-map", "decision", "add-check", "remove-check", "bind"},
-    "implementer": COMMON_READ | {"bind", "impl-map", "add-check", "gate"},
+    "implementer": COMMON_READ | {"bind", "impl-map", "add-check", "gate", "cf"},
     "reviewer": COMMON_READ,
 }
 WORK_COMMANDS = {"req", "accept", "risk", "verify", "assume", "question", "drop", "design-map", "decision",
@@ -830,7 +915,7 @@ BRANCH_SWITCH = re.compile(r"\bgit\s+(?:-C\s+\S+\s+)?(switch\b|checkout\s+(-b|-B
 def check_bash(role, cmd, project, state, cfg):
     if not cfg["automation"].get("enforce_roles", True):
         return None
-    if re.search(r"aqdlc\.py[\"']?\s+[\"']?(hook\b|[a-z-]+-hook\b)", cmd):
+    if re.search(r"aqdlc\.py\s+(hook\b|[a-z-]+-hook\b)", _normalize(cmd)):
         return "hook 用のコマンドは手動で実行できません。"
     subs = ENGINE_RE.findall(cmd)
     for sub in subs:
@@ -901,8 +986,13 @@ def forged_hook(project, hook_name):
     a = load_json(os.path.join(rd, "actor.json"), {}) or {}
     if time.time() - a.get("at", 0) > 60:
         return False
-    cmd = a.get("cmd", "")
+    cmd = _normalize(a.get("cmd", ""))
     return bool(re.search(r"\bhook\b", cmd) and hook_name in cmd)
+
+
+def _normalize(cmd):
+    """引用符・バックスラッシュで語を分ける書き方（ho""ok など）を詰めて判定する（完全ではない）。"""
+    return re.sub(r"[\"'\\]", "", cmd or "")
 
 
 def real_target(path):
@@ -923,6 +1013,11 @@ def bash_snapshot_dir(project):
     from .project import home
     key = hashlib.sha1(os.path.realpath(project).encode("utf-8")).hexdigest()[:16]
     return os.path.join(home(), "tmp", key)
+
+
+def bash_human_path(project, tool_use_id):
+    safe = re.sub(r"[^A-Za-z0-9_-]", "_", tool_use_id or "last")[:80]
+    return os.path.join(bash_snapshot_dir(project), f"human-{safe}.json")
 
 
 def bash_snapshot_path(project, tool_use_id):
@@ -958,8 +1053,9 @@ def check_write(role, path, project, state, cfg):
     if is_within(path, h):
         # 全体設定・実行中の記録は、エージェントからは変更できない（Memory は統括だけが書ける）
         if is_within(path, os.path.join(h, "memory")):
-            return None if role == "orchestrator" else "サブエージェントは共通の Memory を変更できません。"
-        return "AQ-DLC の全体設定・記録（~/.aq-dlc）はエージェントからは変更できません（人が直接編集する）。"
+            return ("共通 Memory（~/.aq-dlc/memory）へは直接書き込めません。プロジェクトの .aq-dlc/memory に保存し、"
+                    "共有する場合は memory-share で人間の承認を得てください（無断の横断共有を防ぐ）。")
+        return "E-AQDL の全体設定・記録（~/.aq-dlc）はエージェントからは変更できません（人が直接編集する）。"
     if not is_within(path, project):
         return None
     rel = os.path.relpath(norm(path), norm(project)).replace(os.sep, "/")
@@ -967,8 +1063,11 @@ def check_write(role, path, project, state, cfg):
     arts = os.path.relpath(norm(artifacts_dir(rd)), norm(project)).replace(os.sep, "/") if rd else None
     base = os.path.basename(rel)
     if rel.startswith(".aq-dlc/"):
-        if base in ("state.json", "config.json", "project.json", "actor.json"):
-            return f"{base} は直接編集できません。エンジンのコマンドで更新してください。"
+        if base in ("state.json", "config.json", "project.json", "actor.json", "ledger.jsonl", "audit.jsonl",
+                    "CURRENT") or base.endswith(".lock"):
+            return f"{base} は直接編集できません（エンジンが記録します）。"
+        if rel.startswith(".aq-dlc/runs/") and base != "run.md" and not (arts and rel.startswith(arts + "/")):
+            return "run の記録（gate・反証テストのログなど）はエンジンが書き込みます。"
         if arts and rel.startswith(arts + "/"):
             own = {"spec.md": "requirements", "design.md": "design", "impl.md": "implementer"}.get(rel[len(arts) + 1:])
             if own is None:

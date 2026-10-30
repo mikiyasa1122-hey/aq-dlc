@@ -21,6 +21,12 @@ class Env:
                         GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.com",
                         GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.com")
         self.env.pop("CLAUDE_PROJECT_DIR", None)
+        # Claude Code の会話記録（人間の返答の照合に使う）を模擬する
+        self.claude_dir = os.path.join(self.tmp, "claude-config")
+        self.env["CLAUDE_CONFIG_DIR"] = self.claude_dir
+        self.transcript = os.path.join(self.claude_dir, "projects", "app", "session.jsonl")
+        os.makedirs(os.path.dirname(self.transcript), exist_ok=True)
+        self._ask_n = 0
         self.env.pop("AQDLC_PROJECT", None)
         self.agent_ids = {}
         if git:
@@ -104,12 +110,37 @@ class Env:
             f.write(textwrap.dedent(text))
         return None
 
+    def _tx(self, obj):
+        with open(self.transcript, "a", encoding="utf-8") as f:
+            f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+
     def human_says(self, text="はい、それで進めてください"):
-        self.hook("user-prompt", {"prompt": text})
+        self._tx({"type": "user", "message": {"role": "user", "content": text}})
+        self.hook("user-prompt", {"prompt": text, "transcript_path": self.transcript})
+
+    def spec_target(self):
+        import re
+        out = self.aq("spec")
+        return re.search(r"仕様 ([0-9a-f]{8})", out) and "SPEC-" + re.search(r"仕様 ([0-9a-f]{8})", out).group(1)
+
+    def approve_spec(self, note="ユーザーが仕様を承認"):
+        """仕様を提示し、人間が対象を指定して承認する流れ。"""
+        import re
+        out = self.aq("spec", "--present")
+        target = re.search(r"承認 (SPEC-[0-9a-f]{8})", out).group(1)
+        self.human_says(f"承認 {target}")
+        return self.aq("spec", "--approve", note)
 
     def human_answers(self, answers):
+        self._ask_n += 1
+        tid = f"toolu_ask{self._ask_n}"
+        self._tx({"type": "assistant", "message": {"role": "assistant", "content": [
+            {"type": "tool_use", "id": tid, "name": "AskUserQuestion", "input": {"questions": []}}]}})
+        text = "User has answered your questions: " + ", ".join(f'"{k}"="{v}"' for k, v in answers.items()) + "."
+        self._tx({"type": "user", "message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": tid, "content": text}]}, "toolUseResult": {"answers": answers}})
         self.hook("post-ask", {"tool_name": "AskUserQuestion", "tool_input": {"questions": []},
-                               "tool_response": {"answers": answers}})
+                               "tool_response": {"answers": answers}, "transcript_path": self.transcript})
 
     # ------------------------------------------------------------ state
     @property
@@ -271,11 +302,14 @@ if __name__ == "__main__":
 '''
 
 
-def build_to_review(e, with_question=True):
-    """仕様承認 → 設計 → 実装 → gate 合格まで進める（各テストの前提）。"""
+def build_to_review(e, with_question=True, config=None):
+    """仕様承認 → 設計 → 実装 → gate 合格まで進める（各テストの前提）。config: プロジェクト設定に足す項目。"""
     py = f'"{sys.executable}"'
     e.aq("init", "メモ")
+    if config:
+        edit_json(os.path.join(e.project, ".aq-dlc", "config.json"), lambda c: c.update(config))
     e.aq("new", "メモ")
+    e.aq("memory-scope", "project")
     assert not denied(e.spawn("requirements"))
     e.start("requirements")
     e.as_role("requirements", "req", "R1", "メモを追加できる", "--critical")
@@ -298,9 +332,7 @@ def build_to_review(e, with_question=True):
         e.write_as("requirements", os.path.relpath(os.path.join(e.arts, "spec.md"), e.project),
                    SPEC_MD + "\n（Q1: 制限なしで確定）\n")
         assert e.stop("requirements", "回答を反映") is None
-    e.aq("spec", "--present")
-    e.human_says("この仕様で進めてください")
-    e.aq("spec", "--approve", "ユーザーが『この仕様で進めて』と返答")
+    e.approve_spec("ユーザーが『この仕様で進めて』と返答")
     assert not denied(e.spawn("design"))
     e.start("design")
     s = e.state()

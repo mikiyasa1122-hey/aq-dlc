@@ -10,16 +10,17 @@ import time
 
 from . import agents as A
 from . import gate as G
+from . import approval as AP
 from . import gitops, memory
 from .project import (cmd_create, cmd_init, cmd_setup, config, engine_cmd, find_project, project_config_path,
                       resolve_project, unregister_active, active_project_for, register_active)
-from .state import (ROLE_LABEL, Ctx, bump, describe_state, ensure_new_id, find, human_event, id_index,
+from .state import (ROLE_LABEL, Ctx, StateError, bump, describe_state, ensure_new_id, find, human_event, id_index,
                     iter_verifications, last_human_seq, load_state, log, new_run, next_action, problems,
                     req_by_id, require_state, run_dir, running_agents, save_state, spec_sheet, trace_rows)
 from .util import (die, info, load_json, now_iso, pop_flag, pop_opt, read_text, save_json, setup_stdio,
                    sh_run, short, split_list, write_text)
 
-USAGE = """AQ-DLC エンジン
+USAGE = """E-AQDL エンジン（Evidence-driven Adaptive Quality Development Lifecycle / 旧 AQ-DLC）
 
 準備:   setup / doctor / init ["<名前>"] / create "<名前>" / publish [--visibility V] [--dry-run] / new "<run名>"
 要求:   req <ID> "<要求>" [--critical] [--kind nonfunctional] / accept <要求ID> <ID> "<受け入れ条件>"
@@ -29,10 +30,13 @@ USAGE = """AQ-DLC エンジン
 実装:   bind <検証ID> [--command "..."] [--checks a,b] [--test "..."] [--level L] / impl-map <要求ID> --files a,b
 統括:   next / status / spec [--present | --approve "<人間の返答の要約>"] / answer <質問ID> "<回答>"
         ask "<質問>" / resume / wait "<理由>" / confirm <検証ID> "<人間の確認内容>" / escalation [<ID> --resolve "<対応>"]
-        gate [--after-merge] / ci [--wait 分] / complete / abort
-Memory: memory [--tags a,b] [--record] / memory-use <ID> --result helped|not_applicable|harmful
-        memory-done [--saved ID,..] [--merged ID,..] [--skipped "<理由>"]
-参照:   trace / history [--since N] / show <ID> / checks / check / metrics [--json]
+        gate [--after-merge] / cf [--plan] [--only M1] / cf-add <検証ID> --file F --line N --op OP
+        cf-mark <M番号> --equivalent "<理由>" / ci [--wait 分] / complete / abort
+Memory: memory-scope none|project|all / memory [--tags a,b] [--record]
+        memory-use <ID> --result helped|not_applicable|harmful|unknown / memory-approve <ID>
+        memory-share propose <ID> | decide | list
+        memory-done --end project|share|none [--saved ID,..] [--merged ID,..] [--skipped "<理由>"]
+参照:   evidence [--json] / roles [--role R] [--check] / trace / history [--since N] / show <ID> / checks / check / metrics [--json] / audit [--verify]
 すべてのコマンドに --project <パス> を付けられる（省略時はカレントから探す）。"""
 
 
@@ -67,7 +71,12 @@ KIND_ALIASES = {"機能": "functional", "非機能": "nonfunctional", "functiona
 def cmd_new(args):
     force = pop_flag(args, "--force")
     project = resolve_project(args)
-    cur, _ = load_state(project)
+    try:
+        cur, _ = load_state(project)
+    except StateError as e:
+        if not force:
+            die(str(e))
+        cur = None
     if cur and cur.get("status") in ("in_progress", "pr_ready") and not force:
         die(f"進行中の run があります: {cur['run_id']}（{cur.get('status')}）。complete か abort をしてから始めるか、"
             "--force を付けてください（進行中の run はそのまま残ります）。")
@@ -215,6 +224,8 @@ def cmd_drop(args):
         kind, node, parent = find(s, a[0])
         if kind == "requirement":
             s["requirements"].remove(node)
+            s["design"]["map"].pop(node["id"], None)
+            s["impl"]["map"].pop(node["id"], None)
         elif kind in ("acceptance", "risk"):
             r = req_by_id(s, parent)
             r["acceptance" if kind == "acceptance" else "risks"].remove(node)
@@ -378,7 +389,9 @@ def cmd_spec(args):
         sp["presented_hash"] = ctx.spec_hash
         sp["presented_seq"] = bump(s)
         save_state(spath, s)
-        print(f"\n（仕様 {short(ctx.spec_hash)} を提示として記録。人間の承認を得たら spec --approve \"<返答の要約>\"）")
+        t = AP.target_id("SPEC", ctx.spec_hash)
+        print(f"\n（仕様 {t} を提示として記録。人間に「この仕様で進める（承認 {t}）」/「修正したい」を選んでもらい、"
+              f"承認の返答を得たら spec --approve \"<返答の要約>\"）")
         return
     if sp.get("presented_hash") != ctx.spec_hash:
         die("この版の仕様はまだ人間に提示されていません。spec --present で提示してから確認してください。")
@@ -386,9 +399,20 @@ def cmd_spec(args):
         die("提示の後に人間の返答が記録されていません。AskUserQuestion などで人間に確認し、返答を得てから承認してください。")
     if not approve.strip():
         die("--approve には人間の返答の要約を書いてください。")
-    sp.update({"approved_hash": ctx.spec_hash, "approved_seq": bump(s), "approved_at": now_iso(), "note": approve})
+    target = AP.target_id("SPEC", ctx.spec_hash)
+    decision, ev, _f = AP.find_decision(s, target, sp.get("presented_seq", 0))
+    if decision is None:
+        die(f"提示の後の人間の返答に、この仕様（{target}）への明示的な承認がありません。"
+            f"「承認 {target}」を選択肢に含めて確認し直してください（「OK」などの対象のない返答は承認にしません）。")
+    if decision == "reject":
+        AP.record(s, target, "reject", ev, ctx.rd, approve, "spec")
+        save_state(spath, s)
+        die(f"人間は仕様（{target}）を却下しました。修正の要望を aq-dlc:requirements に依頼してください。")
+    AP.record(s, target, "approve", ev, ctx.rd, approve, "spec")
+    sp.update({"approved_hash": ctx.spec_hash, "approved_seq": bump(s), "approved_at": now_iso(), "note": approve,
+               "approval_target": target})
     s["awaiting_human"] = False
-    log(s, project, "spec.approve", {"hash": ctx.spec_hash, "note": approve})
+    log(s, project, "spec.approve", {"hash": ctx.spec_hash, "target": target, "note": approve})
     save_state(spath, s)
     info(f"仕様 {short(ctx.spec_hash)} の承認を記録しました。次は設計（aq-dlc:design）です。")
 
@@ -442,6 +466,12 @@ def cmd_confirm(args):
             die(f"{a[0]} は自動の検証です。gate で確かめてください。")
         if not s.get("asked_seq") or last_human_seq(s) <= s["asked_seq"]:
             die("ask の後に人間の返答が記録されていません。ask を実行して人間に確認してから記録してください。")
+        target = f"VERIFY-{a[0]}"
+        decision, ev, _f = AP.find_decision(s, target, s["asked_seq"])
+        if decision != "approve":
+            die(f"ask の後の人間の返答に、{a[0]} への明示的な確認（「承認 {target}」）がありません"
+                + ("（却下の返答があります）" if decision == "reject" else "") + "。")
+        AP.record(s, target, "approve", ev, run_dir(project, s.get("run_id")), " ".join(a[1:]), "confirm")
         v.update(confirmed_by="human", confirm_note=" ".join(a[1:]), confirmed_seq=bump(s))
         log(s, project, "confirm", {"id": a[0], "note": v["confirm_note"]})
         info(f"人間の確認として記録しました: {a[0]}")
@@ -457,6 +487,13 @@ def cmd_config_accept(args):
         if not s.get("asked_seq") or last_human_seq(s) <= s["asked_seq"]:
             die("ask の後に人間の返答が記録されていません。設定の変更内容を ask で人間に確認してから実行してください。")
         new = G.config_fp(config(project), project)
+        target = AP.target_id("CFG", new)
+        decision, ev, _f = AP.find_decision(s, target, s["asked_seq"])
+        if decision != "approve":
+            die(f"ask の後の人間の返答に、この設定（{target}）への明示的な承認がありません"
+                + ("（却下の返答があります）" if decision == "reject" else "")
+                + f"。「承認 {target}」を選択肢に含めて確認してください。")
+        AP.record(s, target, "approve", ev, run_dir(project, s.get("run_id")), note, "config")
         log(s, project, "config.accept", {"before": s.get("config_fp_registered"), "after": new, "note": note})
         s["config_fp_registered"] = new
         info("設定の変更を、人間の確認済みとして受け入れました（gate と独立レビューはやり直しになります）。")
@@ -497,7 +534,8 @@ def cmd_gate(args):
     if run and not force and not (actor == "implementer" and all(v["role"] == "implementer" for v in run.values())):
         die("サブエージェントの実行中は gate を実行しません（同じフォルダでテストが衝突するため）。完了を待ってください。")
     spec_block = [p for p in problems(ctx) if p["code"] in ("spec_missing", "spec_unpresented", "spec_unapproved",
-                                                              "questions_open", "spec_unregistered")]
+                                                              "questions_open", "spec_unregistered", "memory_scope",
+                                                              "state_invalid")]
     if spec_block and not force:
         die(f"{spec_block[0]['msg']}。仕様の承認前は gate を実行しません（実装の前に仕様をすり合わせるため）。")
     lock = os.path.join(ctx.rd, "gate.lock")
@@ -562,6 +600,226 @@ def cmd_gate(args):
     info(f"gate 結果: {'合格' if ok else '不合格'}")
 
 
+# ------------------------------------------------------------------ Counterfactual Gate
+def cmd_cf(args):
+    """cf [--plan] [--only M1,M2] — 反証テスト（隔離したコピーに欠陥を入れ、テストが失敗するかを確かめる）"""
+    from . import counterfactual as CF
+    show_plan = pop_flag(args, "--plan")
+    only = split_list(pop_opt(args, "--only"))
+    project, s, spath = open_state(args)
+    cfg = config(project)
+    ctx = Ctx(project, s, cfg, fresh=True)
+    cc = CF.cf_config(cfg)
+    muts, notes = CF.plan(project, s, cfg, source=list(ctx.snap))
+    if show_plan:
+        print(f"反証テストの計画（mode: {cc['mode']}、上限 {cc['max_mutations']} 件、検証ごと {cc['per_verification']} 件）")
+        for m in muts:
+            print(f"  {m['id']} {m['verification']}（{m.get('risk') or m['parent']}）{m['file']}:{m['line']} "
+                  f"{m['category']}\n      - {m['original'].strip()}\n      + {m['mutated'].strip()}")
+        for n in notes:
+            print(f"  注意: {n}")
+        if not muts:
+            print("  対象なし（自動の検証・impl-map の実装ファイル（Python / JS / TS）・適用できる箇所が必要）")
+        return
+    if cc["mode"] == "off":
+        die("counterfactual.mode が off です（反証テストは無効）。使う場合は人間の確認のうえで .aq-dlc/config.json の "
+            "counterfactual.mode を advisory か enforce にしてください（計画の確認だけなら cf --plan）。")
+    if s.get("status") not in ("in_progress", "pr_ready"):
+        die(f"この run は {s.get('status')} です。")
+    from .state import actor_hint, gate_status
+    actor = actor_hint(project)
+    run = running_agents(s)
+    if run and not (actor == "implementer" and all(v["role"] == "implementer" for v in run.values())):
+        die("サブエージェントの実行中は反証テストを実行しません。完了を待ってください。")
+    fresh, passing = gate_status(ctx)
+    if not (fresh and passing):
+        die("最新のコードで通常の Quality Gate に合格していません。反証テストは gate の合格後に実行します。")
+    lock = os.path.join(ctx.rd, "cf.lock")
+    if os.path.exists(lock) and time.time() - os.path.getmtime(lock) < 3600:
+        die("別の反証テストが実行中です（前回が異常終了した場合は数分後に再実行するか、cf.lock を人が削除する）。")
+    write_text(lock, str(os.getpid()))
+    stamp = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    try:
+        info(f"反証テスト {stamp}（{len(muts)} 件、mode: {cc['mode']}）")
+        rec = CF.execute(project, s, cfg, muts, os.path.join(ctx.rd, "cf"), stamp, set(only) if only else None)
+    finally:
+        try:
+            os.remove(lock)
+        except OSError:
+            pass
+    s, spath = load_state(project)
+    ctx2 = Ctx(project, s, cfg)
+    rec["notes"] = notes + rec.get("notes", [])
+    full, _n = CF.plan(project, s, cfg, source=list(ctx.snap), limit=10 ** 6)
+    planned = {m["verification"] for m in muts}
+    rec["unrun"] = sorted({m["verification"] for m in full} - planned)
+    rec.update({"seq": bump(s), "checks_fp": ctx2.checks_fp, "graph_fp": ctx2.graph_fp,
+                "def_fp": CF.definition_fp(s, cfg, muts), "env_fp": CF.env_fp(cfg), "partial": bool(only)})
+    if only:
+        rec["status"] = "partial" if rec["status"] == "done" else rec["status"]
+        rec["notes"].append("一部だけ実行した（--only）。完了判定には全件の実行が必要")
+    eqs = (s.get("counterfactual") or {}).get("equivalent", {})
+    for m in rec["mutations"]:
+        if CF.mutation_key(m) in eqs:
+            m["equivalent"] = eqs[CF.mutation_key(m)]
+    rec["summary"] = CF.summarize(rec)
+    rec["fp"] = CF.fp_now(ctx2, muts)
+    cfst = s.setdefault("counterfactual", {})
+    cfst["latest"] = rec
+    cfst.setdefault("runs", []).append({k: rec[k] for k in ("stamp", "at", "status", "summary", "mode")})
+    cfst["runs"] = cfst["runs"][-20:]
+    log(s, project, "counterfactual", {"stamp": stamp, "status": rec["status"], "summary": rec["summary"]})
+    save_state(spath, s)
+    c = rec["summary"]["counts"]
+    print(f"結果: killed {c['killed']} / survived {c['survived']} / invalid {c['invalid']} / timeout {c['timeout']} / "
+          f"対象外 {c['not_applicable']}（検出率 = killed ÷（killed＋survived）= "
+          f"{rec['summary']['score'] if rec['summary']['score'] is not None else '算出不可'}、"
+          f"母集団 {rec['summary']['valid']} 件、除外 {rec['summary']['excluded']} 件）")
+    for n in rec["notes"]:
+        print(f"  注意: {n}")
+    if rec["status"] != "done":
+        print(f"  ! この結果は使えません（{rec['status']}）")
+    print("  通常の gate の合格とは別の結果です。survived は「テストが欠陥を見逃した」か「等価な変異」のどちらかです。")
+
+
+def cmd_cf_add(args):
+    """cf-add <検証ID> --file <パス> --line <行> --op <operator> — 反証テストの対象を追加する"""
+    from . import mutation as MU
+    rel, line, op = pop_opt(args, "--file"), pop_opt(args, "--line"), pop_opt(args, "--op")
+
+    def fn(project, s, a):
+        if not a or not rel or not line or not op:
+            die(f"使い方: cf-add <検証ID> --file <パス> --line <行> --op <{'|'.join(MU.OPERATORS)}>")
+        _k, v, _p = find(s, a[0], ("verification",))
+        if op not in MU.OPERATORS:
+            die(f"--op は {' / '.join(MU.OPERATORS)} のどれか")
+        r = rel.replace("\\", "/")
+        if os.path.isabs(r) or ".." in r.split("/"):
+            die("--file はプロジェクト内の相対パスで指定してください")
+        path = os.path.join(project, r)
+        if os.path.islink(path) or not os.path.isfile(path):
+            die(f"ファイルがない、またはシンボリックリンクです: {r}")
+        if not MU.language(r):
+            die("対応している言語は Python と JavaScript / TypeScript です")
+        with open(path, encoding="utf-8", newline="") as f:
+            lines = f.read().splitlines(keepends=True)
+        if not str(line).isdigit() or int(line) < 1:
+            die("--line は 1 以上の整数で指定してください")
+        n = int(line)
+        if MU.apply(op, lines, n - 1, MU.language(r)) is None:
+            die(f"{r}:{n} に {op} を適用できません（形式的な適用の検査で不可）")
+        cfst = s.setdefault("counterfactual", {})
+        tid = f"T{len(cfst.get('targets', [])) + 1}"
+        cfst.setdefault("targets", []).append({"id": tid, "verification": a[0], "file": r, "line": n, "operator": op})
+        log(s, project, "cf.add", {"id": tid, "verification": a[0], "file": r, "line": n, "operator": op})
+        info(f"反証テストの対象 {tid} を追加しました: {a[0]} {r}:{n} {op}")
+    mutate(args, fn)
+
+
+def cmd_cf_mark(args):
+    """cf-mark <M番号> --equivalent "<理由>" — survived の変異を等価として除外する（人間の承認が必要）"""
+    from . import counterfactual as CF
+    reason = pop_opt(args, "--equivalent")
+
+    def fn(project, s, a):
+        if not a or not reason:
+            die('使い方: cf-mark <M番号> --equivalent "<等価と判断した理由>"（ask で人間の承認を得てから）')
+        rec = CF.current(s)
+        m = next((x for x in (rec or {}).get("mutations", []) if x["id"] == a[0]), None)
+        if not m:
+            die(f"最新の反証テストに {a[0]} がありません。")
+        if m.get("result") != "survived":
+            die(f"{a[0]} は survived ではありません（{m.get('result')}）。")
+        target = f"EQ-{rec['stamp']}-{a[0]}"
+        if not s.get("asked_seq"):
+            die(f"ask で人間に確認してください（選択肢「等価として除外する（承認 {target}）」）。")
+        decision, ev, _f = AP.find_decision(s, target, s["asked_seq"])
+        if decision != "approve":
+            die(f"ask の後の人間の返答に「承認 {target}」がありません。等価かどうかは人間が判断します。")
+        AP.record(s, target, "approve", ev, run_dir(project, s.get("run_id")), reason, "equivalent")
+        info_ = {"reason": reason, "approval": target, "at": now_iso()}
+        s["counterfactual"].setdefault("equivalent", {})[CF.mutation_key(m)] = info_
+        m["equivalent"] = info_
+        rec["summary"] = CF.summarize(rec)
+        log(s, project, "cf.equivalent", {"id": a[0], "reason": reason})
+        info(f"{a[0]} を等価な変異として除外しました（検出率の母集団から外し、除外件数に数えます）。")
+    mutate(args, fn)
+
+
+# ------------------------------------------------------------------ Role Profile / Evidence
+def cmd_roles(args):
+    """roles [--role R] [--check] [--json] — 適用される Role Profile と理由"""
+    from . import roles as RL
+    check = pop_flag(args, "--check")
+    as_json = pop_flag(args, "--json")
+    role = pop_opt(args, "--role")
+    project = resolve_project(args, required=False)
+    cfg = config(project)
+    profiles, rejected = RL.load_profiles(cfg)
+    if check:
+        print(f"Role Profile: {len(profiles)} 件（{RL.roles_dir()}）")
+        for p in sorted(profiles.values(), key=lambda x: (x["kind"], x["id"])):
+            print(f"  OK {p['kind']:6} {p['id']} v{p['version']} {p['hash'][:12]}  {p['title']}")
+        for r in rejected:
+            print(f"  NG {os.path.basename(r['path'])}: " + " / ".join(r["errors"]))
+        if rejected:
+            sys.exit(1)
+        return
+    s, _ = load_state(project) if project else (None, None)
+    if not s:
+        die("実行中の run がありません（Profile の検査だけなら roles --check）。")
+    ctx = Ctx(project, s, cfg)
+    out = {}
+    for r in ([role] if role else ["requirements", "design", "implementer", "reviewer"]):
+        kind, _items = A.pending_fix(ctx) if r == "implementer" else (None, [])
+        out[r] = RL.public(A.role_selection(r, ctx, kind, (s["agents"].get("prompts") or {}).get(r, "")
+                                            if r == "requirements" else ""))
+    if as_json:
+        print(json.dumps({"current": out, "history": (s.get("roles") or {}).get("history", [])},
+                         ensure_ascii=False, indent=2))
+        return
+    for r, sel in out.items():
+        print(f"■ {ROLE_LABEL.get(r, r)}")
+        for x in sel["stage"]:
+            print(f"  工程: {x['id']} v{x['version']}（{x['title']}）")
+        for x in sel["domain"]:
+            print(f"  追加: {x['id']} v{x['version']} 点数 {x['score']} — {' / '.join(x['reasons'])}"
+                  + (f"（関係: {', '.join(x['related'][:6])}）" if x["related"] else ""))
+        for x in sel["dropped"]:
+            print(f"  見送り: {x['id']} — {x['why']}")
+        if sel.get("rejected"):
+            print("  ! 不正な Profile（使わない）: " + "、".join(x["path"] for x in sel["rejected"]))
+    hist = (s.get("roles") or {}).get("history", [])
+    if hist:
+        print("■ 適用の履歴")
+        for h in hist[-10:]:
+            print(f"  #{h.get('seq')} {h.get('agent')}（{h.get('trigger')}）: "
+                  + ", ".join([x["id"] for x in h.get("stage", [])] + [x["id"] for x in h.get("domain", [])]))
+
+
+def cmd_evidence(args):
+    """evidence [--json] — 検証ごとの証拠の状態（Negative Evidence Graph）"""
+    from . import evidence as EV
+    as_json = pop_flag(args, "--json")
+    project, s, _ = open_state(args)
+    ctx = Ctx(project, s)
+    rows, nodes, counts = EV.summary(ctx)
+    if as_json:
+        print(json.dumps({"verifications": rows, "nodes": nodes, "counts": counts}, ensure_ascii=False, indent=2))
+        return
+    print("受け入れ条件・リスクごとの状態: " + "、".join(f"{EV.LABEL[k]} {v}" for k, v in counts.items()))
+    print("| 要求 | 受入/リスク | 検証 | 種類 | 通常Gate | 反証テスト | レビュー | 状態 | 根拠 | 失効の原因 |")
+    print("|---|---|---|---|---|---|---|---|---|---|")
+    for x in rows:
+        print("| " + " | ".join(str(c).replace("|", "/") for c in [
+            x["requirement"] + ("【重要】" if x["critical"] else ""), x["parent"], x["verification"], x["kind"],
+            x["gate"], x["counterfactual"], x["review"], f"{x['state']}（{EV.LABEL[x['state']]}）",
+            "；".join(x["basis"]), "；".join(x["causes"])]) + " |")
+    missing = [nid for nid, n in nodes.items() if not n["verifications"]]
+    if missing:
+        print("検証のない受け入れ条件・リスク: " + "、".join(missing))
+
+
 def cmd_ci(args):
     wait_min = float(pop_opt(args, "--wait") or 8)
     project, s, spath = open_state(args)
@@ -584,13 +842,13 @@ def cmd_complete(args):
     ctx = Ctx(project, s, fresh=True)
     probs = problems(ctx, "pr")
     if probs:
-        print("[aq-dlc] まだ PR を出せる状態ではありません:\n  - " + "\n  - ".join(p["msg"] for p in probs))
+        print("[E-AQDL] まだ PR を出せる状態ではありません:\n  - " + "\n  - ".join(p["msg"] for p in probs))
         sys.exit(1)
     final = problems(ctx, "final")
     if final:
         s["status"] = "pr_ready"
         save_state(spath, s)
-        print("[aq-dlc] PR を出せる状態です（status: pr_ready）。マージ後の確認が残っています:\n  - "
+        print("[E-AQDL] PR を出せる状態です（status: pr_ready）。マージ後の確認が残っています:\n  - "
               + "\n  - ".join(p["msg"] for p in final)
               + "\n→ PR を作成して報告し、マージを待つ（この間 Stop hook は止めない）。"
                 "\n→ マージ後: 既定ブランチを取り込み → gate --after-merge → 人の確認は ask でまとめて1回 → confirm → complete")
@@ -641,19 +899,27 @@ def cmd_check(args):
     stage = "final" if s.get("status") == "pr_ready" else "pr"
     probs = problems(Ctx(project, s, fresh=True), stage)
     if probs:
-        print("[aq-dlc] 完了条件を満たしていません:\n  - " + "\n  - ".join(p["msg"] for p in probs))
+        print("[E-AQDL] 完了条件を満たしていません:\n  - " + "\n  - ".join(p["msg"] for p in probs))
         sys.exit(1)
     info("完了条件 OK")
 
 
 def cmd_trace(args):
     project, s, _ = open_state(args)
-    rows = trace_rows(Ctx(project, s))
-    head = ["要求", "受入/リスク", "設計", "実装ファイル", "検証", "テスト", "結果", "gate"]
+    from . import evidence as EV
+    ctx = Ctx(project, s)
+    rows = trace_rows(ctx)
+    ev = {x["verification"]: x for x in EV.compute(ctx)}
+    head = ["要求", "受入/リスク", "設計", "実装ファイル", "検証", "テスト", "結果", "gate", "反証テスト", "証拠の状態",
+            "失効の原因"]
     print("| " + " | ".join(head) + " |")
     print("|" + "---|" * len(head))
     for r in rows:
-        print("| " + " | ".join(str(c).replace("|", "/") for c in r) + " |")
+        vid = str(r[4]).split("（")[0]
+        x = ev.get(vid)
+        extra = [x["counterfactual"], f"{x['state']}（{EV.LABEL[x['state']]}）", "；".join(x["causes"])] if x else \
+            ["", "insufficient（証拠不足）", ""]
+        print("| " + " | ".join(str(c).replace("|", "/") for c in list(r) + extra) + " |")
 
 
 def cmd_history(args):
@@ -710,11 +976,59 @@ def collect_metrics(s):
         "stop_blocks_total": s.get("stop_blocks_total", 0),
         "violations": len(s.get("violations", [])),
         "orchestrator_tokens": A.transcript_usage(s.get("session_transcript")),
+        "role_profiles": _role_metrics(s),
+        "counterfactual": _cf_metrics(s),
+        "memory": _memory_metrics(s),
+        "approvals": {"approve": sum(1 for a in s.get("approvals", []) if a.get("decision") == "approve"),
+                      "reject": sum(1 for a in s.get("approvals", []) if a.get("decision") == "reject")},
+        "conditions": {"memory_scope": (s.get("memory_scope") or {}).get("choice"),
+                       "counterfactual_mode": (((s.get("counterfactual") or {}).get("latest") or {}).get("mode")),
+                       "roles_enabled": bool((s.get("roles") or {}).get("history")),
+                       "engine": "E-AQDL" if s.get("eaqdl") else "AQ-DLC v0.5"},
     }
+
+
+def _role_metrics(s):
+    hist = (s.get("roles") or {}).get("history", [])
+    domains = {}
+    for h in hist:
+        for d in h.get("domain", []):
+            domains[d["id"]] = domains.get(d["id"], 0) + 1
+    return {"applications": len(hist), "by_trigger": {t: sum(1 for h in hist if h.get("trigger") == t)
+                                                      for t in ("start", "transition", "sendback")},
+            "domains": domains}
+
+
+def _cf_metrics(s):
+    from . import counterfactual as CF
+    cf = s.get("counterfactual") or {}
+    rec = cf.get("latest")
+    out = {"runs": len(cf.get("runs", [])), "latest": None,
+           "score_definition": "killed ÷（killed＋survived）。invalid・timeout・対象外・等価は母集団から除外し、件数を別に示す"}
+    if rec:
+        sm = CF.summarize(rec)
+        out["latest"] = dict(sm, stamp=rec.get("stamp"), status=rec.get("status"))
+    return out
+
+
+def _memory_metrics(s):
+    mem = s.get("memory") or {}
+    used = mem.get("used", {})
+    res = {}
+    for v in used.values():
+        res[v.get("result")] = res.get(v.get("result"), 0) + 1
+    share = mem.get("share", {})
+    return {"scope": (s.get("memory_scope") or {}).get("choice"), "loaded": len(mem.get("loaded", {})),
+            "results": res, "shared": sum(1 for v in share.values() if v.get("status") == "shared"),
+            "share_rejected": sum(1 for v in share.values() if v.get("status") == "rejected"),
+            "end": (mem.get("report") or {}).get("end")}
 
 
 def cmd_metrics(args):
     as_json = pop_flag(args, "--json")
+    all_runs = pop_flag(args, "--runs")
+    if all_runs:
+        return _metrics_runs(args, as_json)
     project, s, _ = open_state(args)
     m = collect_metrics(s)
     if as_json:
@@ -736,6 +1050,98 @@ def cmd_metrics(args):
     print(f"人間の介入: 返答 {m['human']['replies']} 回・確認依頼 {m['human']['asks']} 回  "
           f"Stop hook による継続: {m['stop_blocks_total']} 回  担当外の変更: {m['violations']} 件")
     print(f"統括のトークン: {tok(m['orchestrator_tokens'])}")
+    rp = m["role_profiles"]
+    print(f"Role Profile の適用: {rp['applications']} 回（開始 {rp['by_trigger']['start']}・遷移 {rp['by_trigger']['transition']}"
+          f"・差し戻し {rp['by_trigger']['sendback']}）追加の専門性: "
+          + ("、".join(f"{k} {v}" for k, v in rp["domains"].items()) or "なし"))
+    cf = m["counterfactual"]
+    if cf["latest"]:
+        c = cf["latest"]["counts"]
+        print(f"反証テスト: {cf['runs']} 回。最新 killed {c['killed']}・survived {c['survived']}・invalid {c['invalid']}・"
+              f"timeout {c['timeout']}・対象外 {c['not_applicable']}・等価 {cf['latest']['equivalent']}、"
+              f"検出率 {cf['latest']['score']}（{cf['score_definition']}）")
+    else:
+        print("反証テスト: 未実行")
+    mm = m["memory"]
+    print(f"Memory: 利用範囲 {mm['scope']}・読み込み {mm['loaded']} 件・結果 {mm['results'] or 'なし'}・"
+          f"共有 {mm['shared']} 件（却下 {mm['share_rejected']}）・終了時 {mm['end']}")
+
+
+def cmd_audit(args):
+    """audit [--verify] [--limit N] — 承認・同意・共有の決定、hook の異常、偽装の疑いの解決（--resolve FORGED-n）、状態の保存拒否の監査ログ"""
+    verify = pop_flag(args, "--verify")
+    resolve = pop_opt(args, "--resolve")
+    limit = int(pop_opt(args, "--limit") or 30)
+    if resolve:
+        def fn(project, s, a):
+            f = next((x for x in s.get("forged_events", []) if x["id"] == resolve), None)
+            if not f:
+                die(f"{resolve} が見つかりません。")
+            if not s.get("asked_seq"):
+                die(f"ask で人間に状況を報告し、「承認 {resolve}」の返答を得てから実行してください。")
+            decision, ev, _f = AP.find_decision(s, resolve, s["asked_seq"])
+            if decision != "approve":
+                die(f"ask の後の人間の返答に「承認 {resolve}」がありません。")
+            AP.record(s, resolve, "approve", ev, run_dir(project, s.get("run_id")), "偽装の疑いを人間が確認", "forged")
+            f.update(resolved=True, resolved_at=now_iso())
+            info(f"{resolve} を人間の確認済みにしました。取り消された承認は取り直してください。")
+        return mutate(args, fn)
+    from .project import home
+    project = resolve_project(args, required=False)
+    paths = []
+    if project:
+        s, _ = load_state(project)
+        rd = run_dir(project, s.get("run_id")) if s else None
+        if rd:
+            paths.append(("この run", os.path.join(rd, "audit.jsonl")))
+    paths.append(("全体（hook の異常・共通 Memory の共有）", os.path.join(home(), "audit.jsonl")))
+    paths.append(("共通 Memory", os.path.join(home(), "memory", "audit.jsonl")))
+    bad = False
+    for label, path in paths:
+        n, errs = AP.audit_verify(path)
+        print(f"■ {label}: {path}（{n} 行）")
+        if verify:
+            if errs:
+                bad = True
+                print("  ! 連鎖の不一致: " + " / ".join(errs[:5]))
+            else:
+                print("  連鎖の確認: 不一致なし（ファイルごと作り直す改ざんは検出できない）")
+        for rec in AP.audit_read(path, limit):
+            detail = {k: v for k, v in rec.items() if k not in ("at", "event")}
+            print(f"  {rec.get('at')} {rec.get('event')} {json.dumps(detail, ensure_ascii=False)[:300]}")
+    if bad:
+        sys.exit(1)
+
+
+def _metrics_runs(args, as_json):
+    """metrics --runs — このプロジェクトの run を条件ごとに並べる（比較実験の材料。統計的な結論は出さない）"""
+    from .state import runs_dir, migrate
+    project = resolve_project(args)
+    rows = []
+    d = runs_dir(project)
+    for rid in sorted(os.listdir(d)) if os.path.isdir(d) else []:
+        if not os.path.isfile(os.path.join(d, rid, "state.json")):
+            continue
+        st = load_json(os.path.join(d, rid, "state.json"), None)
+        if not isinstance(st, dict):
+            continue
+        st = migrate(st)
+        m = st.get("metrics") or collect_metrics(st)
+        rows.append({"run": rid, "status": st.get("status"), **m["conditions"], "gate_failed": m["gate"]["failed"],
+                     "fix_iterations": m["fix_iterations"], "reviews_needs_fix": m["reviews"]["needs_fix"],
+                     "cf_score": ((m["counterfactual"].get("latest") or {}).get("score")),
+                     "human_asks": m["human"]["asks"], "run_sec": m["run_sec"]})
+    if as_json:
+        print(json.dumps(rows, ensure_ascii=False, indent=2))
+        return
+    print("| run | 状態 | エンジン | Memory | 反証 | gate 不合格 | 修正ループ | レビュー要修正 | 検出率 | 確認依頼 | 秒 |")
+    print("|---|---|---|---|---|---|---|---|---|---|---|")
+    for r in rows:
+        print(f"| {r['run']} | {r['status']} | {r['engine']} | {r['memory_scope']} | {r['counterfactual_mode']} | "
+              f"{r['gate_failed']} | {r['fix_iterations']} | {r['reviews_needs_fix']} | {r['cf_score']} | "
+              f"{r['human_asks']} | {r['run_sec']} |")
+    print(f"run 数 {len(rows)}。課題・受け入れ条件・評価基準・モデルが揃っていない run どうしの差は、改善の根拠にならない。"
+          "少ない試行の差を統計的な改善と断定しない。")
 
 
 def cmd_doctor(args):
@@ -777,11 +1183,13 @@ LANG_RULE = ("【言語】ユーザーへの返答、質問、進捗報告、run
 
 
 def read_payload():
+    """hook の入力。読めなければ None（安全側の判断に使う）。"""
     from .util import decode
     try:
-        return json.loads(decode(sys.stdin.buffer.read()) or "{}")
+        data = json.loads(decode(sys.stdin.buffer.read()) or "{}")
+        return data if isinstance(data, dict) else None
     except Exception:  # noqa: BLE001
-        return {}
+        return None
 
 
 def emit(obj):
@@ -794,9 +1202,16 @@ def hook_context(payload):
     project = active_project_for(cwd)
     state, spath = (load_state(project) if project else (None, None))
     tp = payload.get("transcript_path")
-    if state and tp and not payload.get("agent_type") and state.get("session_transcript") != tp:
-        state["session_transcript"] = tp  # 統括の会話記録（トークンの集計に使う）
-        save_state(spath, state)
+    if state and tp and not payload.get("agent_type"):
+        changed = False
+        if state.get("session_transcript") != tp:
+            state["session_transcript"] = tp  # 統括の会話記録（トークンの集計に使う）
+            changed = True
+        if AP.trusted_transcript(tp) and tp not in state.setdefault("transcripts", []):
+            state["transcripts"] = (state["transcripts"] + [tp])[-10:]  # 人間の返答の照合に使う
+            changed = True
+        if changed:
+            save_state(spath, state)
     return cwd, project, state, spath
 
 
@@ -821,6 +1236,10 @@ def hook_pre_bash(payload):
     why = A.check_bash(role, cmd, project, state, cfg)
     if why:
         return A.deny(why)
+    if state:
+        # すべての担当の Bash について、実行前の seq を記録する（実行中に「人間の返答」が増えたら偽装として扱う）
+        save_json(A.bash_human_path(project, payload.get("tool_use_id")),
+                  {"seq": int(state.get("seq", 0)), "run": state.get("run_id"), "role": role, "cmd": cmd[:500]})
     # 実装担当以外の Bash は、実行前のコードと設定の状態をプロジェクトの外に記録し、実行後に比べる。
     # run がない間も「記録した」こと自体は残す（実行後に記録が消えていたら改ざんとして扱うため）。
     if role != "implementer":
@@ -857,11 +1276,20 @@ def hook_post_bash(payload):
     リダイレクト・スクリプト・変数展開などの書き方に関係なく、実行前後のファイル内容で判定する。
     """
     role = A.role_of(payload.get("agent_type"))
-    if role == "implementer":
-        return None
     cwd, project, state, spath = hook_context(payload)
     if not project:
         return None
+    forged = _check_forged_human(project, payload)
+    if role == "implementer":
+        return forged
+    res = _post_bash_changes(payload, role, project, state)
+    if forged and res:
+        forged["reason"] += "\n" + res["reason"]
+        forged["hookSpecificOutput"]["additionalContext"] = forged["reason"]
+    return forged or res
+
+
+def _post_bash_changes(payload, role, project, state):
     snap_path = A.bash_snapshot_path(project, payload.get("tool_use_id"))
     pre = load_json(snap_path, None)
     active = bool(state and state.get("status") in ("in_progress", "pr_ready"))
@@ -917,12 +1345,90 @@ def hook_post_bash(payload):
     save_state(spath, state)
     who = ROLE_LABEL.get(role, "統括")
     detail = f"{v['count']} 件: {', '.join(v['files'][:5])}" if v.get("files") else v.get("note", "")
-    reason = (f"AQ-DLC: 担当外の変更を検出しました（{who} の Bash: {detail}）。"
+    reason = (f"E-AQDL: 担当外の変更を検出しました（{who} の Bash: {detail}）。"
               "run の実行中にコードやテストを変えられるのは実装担当だけで、設定はエンジンのコマンドでだけ変えます。"
               "この変更は記録され、実装担当の確認・取り込み（設定なら人間の確認）と gate・独立レビューのやり直しが"
               "済むまで、レビュー・完了に進めません。")
     if v["kind"] == "git":
         reason += "（git の操作による作業ツリーの変化も、取り込みの確認が必要です）"
+    return {"decision": "block", "reason": reason,
+            "hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": reason}}
+
+
+def _check_forged_human(project, payload):
+    """Bash の実行中に記録された「人間の返答」は、hook を直接呼んだ偽装として無効にする。
+
+    人間の発言（UserPromptSubmit）と AskUserQuestion の回答は、Bash の実行中には届かない。実行中に増えた
+    返答は、承認の判定に使わないようにし、それに基づく承認を取り消す。
+    """
+    path = A.bash_human_path(project, payload.get("tool_use_id"))
+    pre = load_json(path, None)
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+    if not pre:
+        return None
+    state, spath = load_state(project)
+    if not state or state.get("run_id") != pre.get("run"):
+        return None
+    bad = [e for e in state.get("human_events", []) if e.get("seq", 0) > pre["seq"] and e.get("kind") != "forged"]
+    if not bad:
+        return None
+    seqs = {e["seq"] for e in bad}
+    for e in bad:
+        e.update(kind="forged", parsed=False)
+    revoked = set()
+    for a in list(state.get("approvals", [])):
+        if a.get("event_seq") in seqs and a.get("decision") == "approve":
+            state["approvals"].append(dict(a, decision="revoked", at=now_iso(), note="Bash の実行中に記録された返答による承認"))
+            revoked.add(a["target"])
+    sp = state.get("spec") or {}
+    if sp.get("approval_target") in revoked:
+        for k in ("approved_hash", "approved_seq", "approved_at", "approval_target"):
+            sp.pop(k, None)
+    ms = state.get("memory_scope") or {}
+    if ms.get("event_seq") in seqs or (ms.get("seq", 0) > pre["seq"] and ms.get("source") in ("approval", "user_reply")):
+        state.pop("memory_scope", None)
+    # 取り消せる操作は元に戻す（設定の受け入れ・等価の除外・共通 Memory への共有）
+    for h in reversed(state.get("history", [])):
+        if h.get("action") == "config.accept" and h.get("seq", 0) > pre["seq"] and \
+                AP.target_id("CFG", (h.get("detail") or {}).get("after")) in revoked:
+            state["config_fp_registered"] = h["detail"].get("before")
+    cfst = state.get("counterfactual") or {}
+    for k, v in list((cfst.get("equivalent") or {}).items()):
+        if v.get("approval") in revoked:
+            cfst["equivalent"].pop(k)
+    for m in ((cfst.get("latest") or {}).get("mutations") or []):
+        if (m.get("equivalent") or {}).get("approval") in revoked:
+            m.pop("equivalent")
+    for sid, sh in ((state.get("memory") or {}).get("share") or {}).items():
+        if sid in revoked and sh.get("status") == "shared" and sh.get("dest"):
+            from .project import home as _home
+            q = os.path.join(_home(), "memory-quarantine", os.path.basename(sh["dest"]) + f".{sid}")
+            try:
+                os.makedirs(os.path.dirname(q), exist_ok=True)
+                shutil.move(sh["dest"], q)
+            except OSError:
+                pass
+            sh.update(status="revoked", quarantined=q)
+            AP.audit_append(os.path.join(_home(), "memory", "audit.jsonl"), "memory.share.revoked", share=sid,
+                            quarantined=q)
+    from .state import iter_verifications as _iv
+    for _r, _p, v in _iv(state):
+        if v.get("confirmed_by") == "human" and f"VERIFY-{v['id']}" in revoked:
+            for k in ("confirmed_by", "confirm_note", "confirmed_seq"):
+                v.pop(k, None)
+    fid = f"FORGED-{bump(state)}"
+    state.setdefault("forged_events", []).append({"id": fid, "seqs": sorted(seqs), "role": pre.get("role"),
+                                                  "cmd": pre.get("cmd"), "at": now_iso(), "revoked": sorted(revoked),
+                                                  "resolved": False})
+    save_state(spath, state)
+    rd = run_dir(project, state.get("run_id"))
+    AP.audit_append(os.path.join(rd, "audit.jsonl"), "human.forged", id=fid, seqs=sorted(seqs),
+                    revoked=sorted(revoked), cmd=pre.get("cmd"))
+    reason = (f"E-AQDL: Bash の実行中に「人間の返答」が記録されました（{fid}）。hook を直接呼んだ偽装として無効にし、"
+              f"それに基づく承認（{', '.join(sorted(revoked)) or 'なし'}）を取り消しました。人間に状況を報告してください。")
     return {"decision": "block", "reason": reason,
             "hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": reason}}
 
@@ -945,7 +1451,7 @@ def hook_pre_agent(payload):
     if not project:
         role = A.role_of((payload.get("tool_input") or {}).get("subagent_type"))
         if role in A.ROLES:
-            return A.deny("AQ-DLC プロジェクトではありません。init で初期化し、new で run を開始してください。")
+            return A.deny("E-AQDL プロジェクトではありません。init で初期化し、new で run を開始してください。")
         return None
     return A.on_pre_agent(payload, project, state, spath)
 
@@ -974,8 +1480,8 @@ def hook_post_ask(payload):
         return None
     cwd, project, state, spath = hook_context(payload)
     if state and state.get("status") in ("in_progress", "pr_ready"):
-        resp = payload.get("tool_response")
-        human_event(state, "answer", json.dumps(resp, ensure_ascii=False) if not isinstance(resp, str) else resp)
+        text, parsed = AP.parse_ask_response(payload.get("tool_response"))
+        human_event(state, "answer", text, parsed)
         save_state(spath, state)
     return None
 
@@ -993,7 +1499,7 @@ def hook_stop(payload):
     ctx = Ctx(project, state, cfg, fresh=state.get("status") == "complete")
     total_cap = int(cfg["automation"].get("max_total_continues", 200))
     if int(state.get("stop_blocks_total", 0)) >= total_cap and state.get("status") != "complete":
-        print(f"[aq-dlc] run 全体での自動継続の上限（{total_cap}回）に達したため停止を許可しました。"
+        print(f"[E-AQDL] run 全体での自動継続の上限（{total_cap}回）に達したため停止を許可しました。"
               "状況を確認して人間が判断してください。", file=sys.stderr)
         return None
     if state.get("status") == "complete":
@@ -1009,13 +1515,13 @@ def hook_stop(payload):
     if state.get("stop_blocks", 0) >= max_blocks:
         state["stop_blocks"] = 0
         save_state(spath, state)
-        print(f"[aq-dlc] 自動継続の上限（{max_blocks}回）に達したため停止を許可しました。", file=sys.stderr)
+        print(f"[E-AQDL] 自動継続の上限（{max_blocks}回）に達したため停止を許可しました。", file=sys.stderr)
         return None
     phase, nxt, _probs = next_action(ctx)
     state["stop_blocks"] = state.get("stop_blocks", 0) + 1
     state["stop_blocks_total"] = int(state.get("stop_blocks_total", 0)) + 1
     save_state(spath, state)
-    reason = (f"AQ-DLC: run が進行中です（{project} / フェーズ: {phase}）。\n次: {nxt}\n"
+    reason = (f"E-AQDL: run が進行中です（{project} / フェーズ: {phase}）。\n次: {nxt}\n"
               "人間の判断が必要なら ask を実行してから質問してください。中断するなら abort。\n"
               "（報告や記録はすべて日本語で書いてください）")
     return {"decision": "block", "reason": reason}
@@ -1031,8 +1537,8 @@ def hook_session_start(payload):
     eng = engine_cmd()
     if project:
         state, _ = load_state(project)
-        lines = [f"このフォルダは AQ-DLC プロジェクトです（{project}）。",
-                 "あなたは AQ-DLC の統括（Main Orchestrator）です。開発・修正・機能追加の依頼は、コマンドがなくても "
+        lines = [f"このフォルダは E-AQDL プロジェクトです（{project}）。",
+                 "あなたは E-AQDL の統括（Main Orchestrator）です。開発・修正・機能追加の依頼は、コマンドがなくても "
                  "aq-dlc:start Skill の手順で進めます。要求分析・設計・実装・レビューはサブエージェントに任せ、"
                  "あなたは進行管理・人間への確認・Quality Gate の実行に専念してください。"]
         if state and state.get("status") in ("in_progress", "pr_ready"):
@@ -1049,7 +1555,7 @@ def hook_session_start(payload):
             return None
         lines = [f"このフォルダ（{cwd}）は空です。",
                  "ユーザーが新しいアプリやツールの作成を依頼したら、コマンドを打たれなくても aq-dlc:start Skill を使い、"
-                 "このフォルダを AQ-DLC プロジェクトとして初期化して開発してください。",
+                 "このフォルダを E-AQDL プロジェクトとして初期化して開発してください。",
                  "開発以外の質問や雑談なら、通常どおり答えてください。"]
     if sys.platform == "win32":
         lines.append("【Windows】Playwright を使う場合は、ブラウザをプロジェクト内に入れてください"
@@ -1066,7 +1572,8 @@ HOOKS = {
 }
 LEGACY_HOOKS = {"stop-hook": "stop", "guard-hook": "pre-bash", "session-hook": "session-start",
                 "agent-start-hook": None, "agent-stop-hook": None}
-FAIL_CLOSED = {"pre-bash"}
+# 許可してよいと確定できないときは拒否する hook（PreToolUse）
+FAIL_CLOSED = {"pre-bash", "pre-write", "pre-agent"}
 
 
 def _record_hook_error(payload, err):
@@ -1083,7 +1590,24 @@ def _record_hook_error(payload, err):
             save_state(spath, state)
     except Exception:  # noqa: BLE001
         pass
-    print(f"[aq-dlc] 変更の検出でエラーが発生したため、確認が必要な変更として記録しました: {err}", file=sys.stderr)
+    print(f"[E-AQDL] 変更の検出でエラーが発生したため、確認が必要な変更として記録しました: {err}", file=sys.stderr)
+
+
+def _hook_project(payload):
+    cwd = (payload or {}).get("cwd") or os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+    try:
+        return active_project_for(cwd) or find_project(cwd)
+    except (Exception, SystemExit):  # noqa: BLE001
+        return None
+
+
+def _audit_hook(name, payload, why):
+    from .project import home
+    AP.audit_append(os.path.join(home(), "audit.jsonl"), "hook.error", hook=name, reason=str(why)[:300],
+                    cwd=str((payload or {}).get("cwd", ""))[:300], tool=str((payload or {}).get("tool_name", "")))
+
+
+RECOVERY_CMD = re.compile(r"^\s*(\S*python3?\S*\s+)?[\"']?\S*aqdlc\.py[\"']?\s+(new|status|doctor|audit)\b[^;&|`$()<>]*$")
 
 
 def run_hook(name):
@@ -1091,23 +1615,42 @@ def run_hook(name):
     fn = HOOKS.get(name)
     if not fn:
         return
-    if name != "pre-bash":
-        cwd = payload.get("cwd") or os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
-        if A.forged_hook(active_project_for(cwd), name):
-            print("[aq-dlc] Bash から hook を直接呼ぶことはできません。", file=sys.stderr)
+    if payload is None:
+        # 入力を読めない。重要な PreToolUse は、E-AQDL のプロジェクトの中なら許可しない
+        _audit_hook(name, None, "hook の入力（JSON）を読めない")
+        if name in FAIL_CLOSED and _hook_project({}):
+            emit(A.deny("hook の入力を読めなかったため、安全のため止めました。もう一度実行してください。"))
+        return
+    if name not in FAIL_CLOSED and name != "post-bash":
+        # 重要な PreToolUse は偽装の判定をしない（偽装しても許可されることはないため、常に通常の判定をする）
+        if A.forged_hook(_hook_project(payload), name):
+            print("[E-AQDL] Bash から hook を直接呼ぶことはできません。", file=sys.stderr)
             return
     try:
         emit(fn(payload))
-    except SystemExit:
+    except SystemExit as e:
+        # 状態・設定を読めない（die）など。重要な PreToolUse は許可せずに止める
+        if name in FAIL_CLOSED and e.code not in (0, None) and _hook_project(payload):
+            _audit_hook(name, payload, f"処理が中断された（終了コード {e.code}）")
+            emit(A.deny("状態・設定を読めないため、許可してよいか確定できず止めました。"
+                        "state.json・config.json が壊れていないか人間に確認してください。"))
+            return
         raise
     except Exception as e:  # noqa: BLE001
+        _audit_hook(name, payload, e)
+        if name == "pre-bash" and isinstance(e, StateError) and RECOVERY_CMD.match(
+                (payload.get("tool_input") or {}).get("command", "") or ""):
+            return  # 状態を読めないときの復旧（new --force・status・doctor・audit）だけは許可する
         if name == "post-bash":
             _record_hook_error(payload, e)
             return
-        if name in FAIL_CLOSED and gitops.dangerous_words((payload.get("tool_input") or {}).get("command", "") or ""):
-            emit(A.deny(f"ガードの判定中にエラーが発生したため、安全のため止めました（{e}）"))
-            return
-        print(f"[aq-dlc] hook（{name}）でエラーが発生しました（作業は継続します）: {e}", file=sys.stderr)
+        if name in FAIL_CLOSED:
+            cmd = (payload.get("tool_input") or {}).get("command", "") or ""
+            if _hook_project(payload) or gitops.dangerous_words(cmd):
+                emit(A.deny(f"判定の処理でエラーが発生し、許可してよいか確定できないため止めました（{e}）。"
+                            "状況を人間に報告してください（監査ログ: ~/.aq-dlc/audit.jsonl）。"))
+                return
+        print(f"[E-AQDL] hook（{name}）でエラーが発生しました（作業は継続します）: {e}", file=sys.stderr)
 
 
 # ------------------------------------------------------------------ main
@@ -1121,9 +1664,12 @@ COMMANDS = {
     "bind": cmd_bind, "impl-map": cmd_impl_map,
     "spec": cmd_spec, "answer": cmd_answer, "ask": cmd_ask, "resume": cmd_resume, "wait": cmd_wait,
     "confirm": cmd_confirm, "escalation": cmd_escalation, "gate": cmd_gate, "ci": cmd_ci,
-    "memory": memory.cmd_memory, "memory-done": memory.cmd_memory_done, "memory-use": memory.cmd_memory_use, "complete": cmd_complete, "abort": cmd_abort,
+    "memory": memory.cmd_memory, "memory-done": memory.cmd_memory_done, "memory-use": memory.cmd_memory_use,
+    "memory-scope": memory.cmd_memory_scope, "memory-approve": memory.cmd_memory_approve,
+    "memory-share": memory.cmd_memory_share, "complete": cmd_complete, "abort": cmd_abort,
     "next": cmd_next, "status": cmd_status, "check": cmd_check, "trace": cmd_trace, "history": cmd_history,
-    "show": cmd_show, "metrics": cmd_metrics, "config-accept": cmd_config_accept,
+    "show": cmd_show, "metrics": cmd_metrics, "config-accept": cmd_config_accept, "audit": cmd_audit,
+    "cf": cmd_cf, "cf-add": cmd_cf_add, "cf-mark": cmd_cf_mark, "roles": cmd_roles, "evidence": cmd_evidence,
 }
 REMOVED = {"review": "レビュー結果は aq-dlc:reviewer の終了時にエンジンが自動で記録します（手動では記録できません）。",
            "phase": "フェーズは状態から自動で決まります（next で確認）。",
@@ -1158,4 +1704,7 @@ def main(argv=None):
             why = A.engine_policy(project, name, rest, config(project))
             if why:
                 die(why)
-    COMMANDS[name](rest)
+    try:
+        COMMANDS[name](rest)
+    except StateError as e:
+        die(str(e))

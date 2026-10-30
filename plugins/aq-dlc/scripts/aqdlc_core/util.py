@@ -55,11 +55,11 @@ def now_iso():
 
 
 def info(msg):
-    print(f"[aq-dlc] {msg}")
+    print(f"[E-AQDL] {msg}")
 
 
 def die(msg, code=1):
-    print(f"[aq-dlc] {msg}", file=sys.stderr)
+    print(f"[E-AQDL] {msg}", file=sys.stderr)
     sys.exit(code)
 
 
@@ -80,6 +80,45 @@ def save_json(path, data):
         json.dump(data, f, ensure_ascii=False, indent=2)
         f.write("\n")
     os.replace(tmp, path)
+
+
+class FileLock:
+    """複数のプロセス（hook とコマンド）が同じファイルを同時に書き換えないための排他ロック。
+
+    ロックファイルを O_EXCL で作る。古いロック（stale 秒以上前）は異常終了の残りとして消す。
+    """
+
+    def __init__(self, path, timeout=5.0, stale=30.0):
+        self.path, self.timeout, self.stale = path + ".lock", timeout, stale
+        self.fd = None
+
+    def __enter__(self):
+        os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
+        deadline = time.time() + self.timeout
+        while True:
+            try:
+                self.fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                os.write(self.fd, str(os.getpid()).encode())
+                return self
+            except FileExistsError:
+                try:
+                    if time.time() - os.path.getmtime(self.path) > self.stale:
+                        os.remove(self.path)
+                        continue
+                except OSError:
+                    continue
+                if time.time() > deadline:
+                    raise TimeoutError(f"ロックを取得できません: {self.path}")
+                time.sleep(0.05)
+
+    def __exit__(self, *exc):
+        try:
+            if self.fd is not None:
+                os.close(self.fd)
+            os.remove(self.path)
+        except OSError:
+            pass
+        return False
 
 
 def read_text(path, default=None):

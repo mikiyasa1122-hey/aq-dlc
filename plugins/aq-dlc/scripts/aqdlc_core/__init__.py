@@ -1,4 +1,4 @@
-"""AQ-DLC engine package.
+"""E-AQDL engine package.
 
 Modules:
   util      入出力・文字コード・ハッシュなどの共通処理
