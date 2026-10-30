@@ -112,8 +112,10 @@ class FingerprintTest(unittest.TestCase):
     def tearDown(self):
         self.e.cleanup()
 
-    SAME_SIZE = ("import os; p='src/memo.py'; st=os.stat(p); s=open(p).read().replace('==','!='); "
-                 "open(p,'w').write(s); os.utime(p, ns=(st.st_atime_ns, st.st_mtime_ns))")
+    SAME_SIZE = ("import os; p='src/memo.py'; st=os.stat(p); "
+                 "s=open(p, encoding='utf-8', newline='').read().replace('==','!='); "
+                 "open(p, 'w', encoding='utf-8', newline='').write(s); "
+                 "os.utime(p, ns=(st.st_atime_ns, st.st_mtime_ns))")
 
     def test_orchestrator_same_size_edit_is_detected(self):
         e = self.e
@@ -269,6 +271,57 @@ class LoopCapTest(unittest.TestCase):
             with open(os.path.join(e.project, "src", "memo.py"), "a", encoding="utf-8") as f:
                 f.write("# x\n")
             self.assertIn("人間の確認", e.next())
+        finally:
+            e.cleanup()
+
+
+class PreviousFindingMentionTest(unittest.TestCase):
+    """再検証で見つかった誤検知: 前回の指摘ラベルへの言及で、正しい合格を無効にしない。"""
+
+    def test_mention_outside_findings_section(self):
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                        "plugins", "aq-dlc", "scripts"))
+        from aqdlc_core.agents import parse_review
+        msg = review("判定: 合格", 0, 0).replace(
+            "### 確認したこと\n", "### 確認したこと\n- [重大1] 前回の指摘は src/memo.py で解消済み\n"
+            "- 前回の【重大2】も解消\n")
+        rec, errs = parse_review(msg)
+        self.assertEqual(errs, [])
+        self.assertTrue(rec["passed"])
+        # 指摘の節にあれば数える
+        msg2 = review("判定: 合格", 0, 0, "- 前回の [重大1] は未解消")
+        rec2, errs2 = parse_review(msg2)
+        self.assertFalse(rec2["passed"])
+        # 指摘の節がなければ不正
+        rec3, errs3 = parse_review(review("判定: 合格", 0, 0).replace("### 指摘\n- なし\n", ""))
+        self.assertFalse(rec3["passed"])
+
+
+class ClaudeSettingsTest(unittest.TestCase):
+    """再検証で見つかった取りこぼし: Bash で .claude の設定を書いて hook を無効にする。"""
+
+    def test_bash_writes_claude_settings(self):
+        e = Env()
+        try:
+            build_to_review(e, with_question=False)
+            bash_as(e, "orchestrator", "mkdir -p .claude && echo '{\"disableAllHooks\": true}' > .claude/settings.local.json")
+            self.assertIn(".claude", e.state()["violations"][-1].get("note", ""))
+            self.assertIn("設定", e.aq("check", ok=False))
+            self.assertTrue(denied(e.spawn("reviewer")))
+        finally:
+            e.cleanup()
+
+    def test_engine_add_check_is_not_a_violation(self):
+        e = Env()
+        try:
+            build_to_review(e, with_question=False)
+            from helpers import ENGINE
+            py = sys.executable.replace(os.sep, "/")
+            eng = ENGINE.replace(os.sep, "/")
+            proj = e.project.replace(os.sep, "/")
+            _pre, post = bash_as(e, "design", f"'{py}' '{eng}' add-check lint true --kind lint --project '{proj}'")
+            self.assertFalse(e.state().get("violations"))
+            self.assertIsNone(post)
         finally:
             e.cleanup()
 

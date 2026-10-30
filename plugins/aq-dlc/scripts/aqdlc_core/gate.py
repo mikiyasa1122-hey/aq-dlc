@@ -134,9 +134,33 @@ def checks_fp(cfg):
     return fingerprint(sorted(check_fp(c, cfg) for c in cfg.get("checks", [])))
 
 
-def config_fp(cfg):
-    """実際に使われる設定全体（全体設定＋プロジェクト設定）の指紋。指紋の対象・自動化の境界の改ざんを検出する。"""
-    return fingerprint({k: v for k, v in cfg.items() if not k.startswith("_")})
+PROTECTED_CLAUDE = re.compile(r"^\.claude/(settings[^/]*\.json$|agents/|hooks/|skills/|commands/)")
+
+
+def protected_files_fp(project):
+    """.claude の設定（hook の無効化など）・エージェント定義・hook・Skill の内容の指紋。"""
+    root = os.path.join(project, ".claude")
+    items = []
+    if os.path.isdir(root):
+        for dirpath, _d, files in os.walk(root):
+            for name in files:
+                p = os.path.join(dirpath, name)
+                rel = os.path.relpath(p, project).replace(os.sep, "/")
+                if PROTECTED_CLAUDE.match(rel):
+                    try:
+                        items.append([rel, sha1_file(p)])
+                    except OSError:
+                        items.append([rel, "unreadable"])
+    return fingerprint(sorted(items))
+
+
+def config_fp(cfg, project=None):
+    """実際に使われる設定の指紋: 全体設定＋プロジェクト設定、および .claude の設定・定義。
+
+    指紋の対象・自動化の境界・hook の無効化などの改ざんを検出する。
+    """
+    return fingerprint({"cfg": {k: v for k, v in cfg.items() if not k.startswith("_")},
+                        "claude": protected_files_fp(project) if project else None})
 
 
 def verification_fp(v, cfg):

@@ -280,11 +280,11 @@ def cmd_add_check(args):
         entry["timeout_sec"] = int(timeout)
     cfg["checks"] = [c for c in cfg.get("checks", []) if c.get("name") != name] + [entry]
     state, spath = load_state(project)
-    if state and state.get("config_fp_registered") and state["config_fp_registered"] != G.config_fp(config(project)):
+    if state and state.get("config_fp_registered") and state["config_fp_registered"] != G.config_fp(config(project), project):
         die("設定がエンジンのコマンド以外で変更されています。先に人間の確認（config-accept）を済ませてください。")
     save_json(path, cfg)
     if state:
-        state["config_fp_registered"] = G.config_fp(config(project))
+        state["config_fp_registered"] = G.config_fp(config(project), project)
         log(state, project, "check.update" if old else "check.add", {"name": name, "before": old, "after": entry})
         save_state(spath, state)
     info(f"チェックを登録しました: {name}（{kind}）→ {command}")
@@ -299,11 +299,11 @@ def cmd_remove_check(args):
     old = next((c for c in cfg.get("checks", []) if c.get("name") == args[0]), None)
     cfg["checks"] = [c for c in cfg.get("checks", []) if c.get("name") != args[0]]
     state, spath = load_state(project)
-    if state and state.get("config_fp_registered") and state["config_fp_registered"] != G.config_fp(config(project)):
+    if state and state.get("config_fp_registered") and state["config_fp_registered"] != G.config_fp(config(project), project):
         die("設定がエンジンのコマンド以外で変更されています。先に人間の確認（config-accept）を済ませてください。")
     save_json(path, cfg)
     if state and old:
-        state["config_fp_registered"] = G.config_fp(config(project))
+        state["config_fp_registered"] = G.config_fp(config(project), project)
         log(state, project, "check.remove", {"name": args[0], "before": old})
         save_state(spath, state)
     info(f"{'削除しました' if old else '見つかりませんでした'}: {args[0]}")
@@ -456,7 +456,7 @@ def cmd_config_accept(args):
             die('使い方: config-accept "<人間の返答の要約>"（ask で変更内容を人間に確認した後に実行する）')
         if not s.get("asked_seq") or last_human_seq(s) <= s["asked_seq"]:
             die("ask の後に人間の返答が記録されていません。設定の変更内容を ask で人間に確認してから実行してください。")
-        new = G.config_fp(config(project))
+        new = G.config_fp(config(project), project)
         log(s, project, "config.accept", {"before": s.get("config_fp_registered"), "after": new, "note": note})
         s["config_fp_registered"] = new
         info("設定の変更を、人間の確認済みとして受け入れました（gate と独立レビューはやり直しになります）。")
@@ -510,7 +510,7 @@ def cmd_gate(args):
         # 実行開始時のコード・チェック定義・検証条件（gate の結果はこれに紐付ける）
         before = G.snapshot(project, cfg, fresh=True)
         checks_fp_before = G.checks_fp(cfg)
-        config_fp_before = G.config_fp(cfg)
+        config_fp_before = G.config_fp(cfg, project)
         vfp_before = {v["id"]: G.verification_fp(v, cfg) for _r, _p, v in iter_verifications(s)}
         t0 = time.time()
         results, ok = G.run_gate(project, s, cfg, iter_verifications, os.path.join(ctx.rd, "gate"), stamp,
@@ -528,7 +528,7 @@ def cmd_gate(args):
     changed_defs = []
     if G.checks_fp(cfg_after) != checks_fp_before:
         changed_defs.append("チェックの定義")
-    if G.config_fp(cfg_after) != config_fp_before:
+    if G.config_fp(cfg_after, project) != config_fp_before:
         changed_defs.append("設定")
     vfp_after = {v["id"]: G.verification_fp(v, cfg_after) for _r, _p, v in iter_verifications(s)}
     if vfp_after != vfp_before:
@@ -838,7 +838,7 @@ def hook_pre_bash(payload):
         save_json(A.bash_snapshot_path(project, payload.get("tool_use_id")),
                   {"role": role, "cmd": cmd[:2000], "active": active,
                    "snapshot": G.snapshot(project, cfg, prev) if active else None,
-                   "ignore_dirs": list(cfg["gate"]["ignore_dirs"]), "config_fp": G.config_fp(cfg)})
+                   "ignore_dirs": list(cfg["gate"]["ignore_dirs"]), "config_fp": G.config_fp(cfg, project)})
     if re.search(r"\b(git|gh)\b|api\.github\.com", cmd):
         try:
             reasons = gitops.guard_reasons(cmd, project, gitops.current_branch, gitops.remote_has_branch)
@@ -864,10 +864,6 @@ def hook_post_bash(payload):
         return None
     snap_path = A.bash_snapshot_path(project, payload.get("tool_use_id"))
     pre = load_json(snap_path, None)
-    try:
-        os.remove(snap_path)
-    except OSError:
-        pass
     active = bool(state and state.get("status") in ("in_progress", "pr_ready"))
     cfg = config(project)
     if pre is None:
@@ -878,18 +874,24 @@ def hook_post_bash(payload):
              "note": "実行前の記録が見つからない（記録の削除・改ざんの可能性）"}
     else:
         notes = []
-        if pre.get("config_fp") and pre["config_fp"] != G.config_fp(cfg):
-            notes.append("設定（config.json）が変更された")
+        now_fp = G.config_fp(cfg, project)
+        if pre.get("config_fp") and pre["config_fp"] != now_fp and not (state and state.get("config_fp_registered") == now_fp):
+            # エンジンのコマンド（add-check など）で登録された変更は除く
+            notes.append("設定（config.json または .claude の設定・定義）が変更された")
         files = []
         if pre.get("snapshot") is not None:
             # 実行前と同じ対象で比べる（設定で対象を外す改ざんをしても、ファイルの変更は見える）
             same = dict(cfg, gate=dict(cfg["gate"], ignore_dirs=pre.get("ignore_dirs", cfg["gate"]["ignore_dirs"])))
-            after = G.snapshot(project, same, pre["snapshot"], fresh=True)
+            # 変更の比較は ctime・inode 付きのキャッシュで十分（utime で ctime は戻せない）。
+            # 全ファイルのハッシュのし直しは、判定と登録の時点で行う（hook の時間制限を超えないため）
+            after = G.snapshot(project, same, pre["snapshot"])
             c, a, r = G.snapshot_diff(pre["snapshot"], after)
             files = c + a + r
-        if not files and not notes:
-            return None
-        if not active and not notes:
+        if (not files and not notes) or (not active and not notes):
+            try:
+                os.remove(snap_path)
+            except OSError:
+                pass
             return None
         v = A.detect_bash_changes(role, pre.get("cmd", ""), {}, {}, project) or \
             {"role": role, "at": now_iso(), "cmd": pre.get("cmd", "")[:500], "kind": "write"}
@@ -900,6 +902,10 @@ def hook_post_bash(payload):
             v["kind"] = "config"
         if notes:
             v["note"] = "、".join(notes)
+    try:
+        os.remove(snap_path)
+    except OSError:
+        pass
     state, spath = load_state(project)
     if not state:
         return None

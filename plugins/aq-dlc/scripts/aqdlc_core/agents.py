@@ -58,6 +58,22 @@ def section(md, keyword):
     return "\n".join(out).strip() if on else None
 
 
+def exact_section(md, title):
+    """見出しの文字が title と完全に一致する節の本文（なければ None）。"""
+    out, on, level = [], False, 0
+    for ln in (md or "").splitlines():
+        m = re.match(r"^(#{1,4})\s+(.*?)\s*#*\s*$", ln)
+        if m:
+            if on and len(m.group(1)) <= level:
+                break
+            if not on and m.group(2).strip().strip("*") == title:
+                on, level = True, len(m.group(1))
+                continue
+        if on:
+            out.append(ln)
+    return "\n".join(out) if on else None
+
+
 def hash_line_ok(md, label, full):
     if not full:
         return False
@@ -418,9 +434,12 @@ def parse_review(text):
     head_block = int(m.group(1)) if m else None
     m = re.search(r"軽微な指摘\s*[:：]\s*\**\s*(\d+)", t)
     head_minor = int(m.group(1)) if m else 0
+    # 指摘は「### 指摘」の節（見出しが「指摘」だけのもの）の中だけを読む。前回の指摘への言及や、
+    # 「確認したこと」に書いたラベルを、今回の指摘として数えない
+    fsec = exact_section(t, "指摘")
     findings = []
     cur = None
-    for ln in t.splitlines():
+    for ln in (fsec or "").splitlines():
         mm = re.match(r"^\s*(?:[-*・]|\d+[.)．])?\s*\**\s*[\[［【]\s*(重大|軽微)\s*(\d+)\s*[\]］】]\**\s*(.*)", ln)
         if mm:
             cur = {"severity": mm.group(1), "label": f"{mm.group(1)}{mm.group(2)}", "text": mm.group(3).strip()}
@@ -434,10 +453,12 @@ def parse_review(text):
         elif ln.strip().startswith("#"):
             cur = None
     missing = bullet_items(section(t, "不足しているリスク"))
-    # 書き方の揺れに関係なく、本文に「重大n」のラベルがあれば重大な指摘として数える（安全側）
-    labels_anywhere = set(re.findall(r"[\[［【]\s*重大\s*(\d+)\s*[\]］】]", t))
+    # 「### 指摘」の節の中では、書き方の揺れに関係なく「重大n」のラベルを数える（安全側）
+    labels_anywhere = set(re.findall(r"[\[［【]\s*重大\s*(\d+)\s*[\]］】]", fsec or ""))
     blocking_entries = max(sum(1 for f in findings if f["severity"] == "重大"), len(labels_anywhere))
     errors = []
+    if fsec is None:
+        errors.append("「### 指摘」の節がない（指摘がなければ「- なし」と書く）")
     if raw_verdict is None:
         errors.append("「判定: 合格」または「判定: 要修正」の行がない")
     elif verdict is None:

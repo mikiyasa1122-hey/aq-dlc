@@ -156,7 +156,7 @@ def new_run(project, title):
     os.makedirs(os.path.join(d, "gate"), exist_ok=True)
     os.makedirs(artifacts_dir(d), exist_ok=True)
     st = empty_state(rid, title)
-    st["config_fp_registered"] = G.config_fp(config(project))
+    st["config_fp_registered"] = G.config_fp(config(project), project)
     save_state(os.path.join(d, "state.json"), st)
     tmpl = read_text(os.path.join(project, ".aq-dlc", "run-template.md"), "# {title}\n")
     with open(os.path.join(d, "run.md"), "w", encoding="utf-8") as f:
@@ -265,7 +265,7 @@ class Ctx:
         self.project, self.state = project, state
         self.fresh = fresh  # True: キャッシュを使わずに全ファイルをハッシュし直す（判定・登録の時点）
         self.cfg = cfg or config(project)
-        self.config_fp = G.config_fp(self.cfg)
+        self.config_fp = G.config_fp(self.cfg, self.project)
         self.rd = run_dir(project, state.get("run_id"))
         self.spec_hash = spec_hash(state, self.rd)
         self.design_hash = doc_hash(self.rd, "design")
@@ -363,6 +363,10 @@ def problems(ctx, stage="pr"):
     auto = cfg["automation"]
     out = []
     reg = s.get("config_fp_registered")
+    if not reg and s.get("status") in ("in_progress", "pr_ready"):
+        out.append(P("config_changed", "この run には設定の指紋が登録されていない（v0.5.1 より前に始まった run）。"
+                     "現在の設定を確認して受け入れる必要がある", "human"))
+        return out
     if reg and reg != ctx.config_fp:
         out.append(P("config_changed", "設定（.aq-dlc/config.json または ~/.aq-dlc/config.json）がエンジンのコマンド以外で"
                      "変更された（指紋の対象・自動化の境界・チェックが変わった可能性）", "human"))
