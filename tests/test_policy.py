@@ -67,5 +67,27 @@ class HumanReplyTest(unittest.TestCase):
             e.cleanup()
 
 
+class BranchTest(unittest.TestCase):
+    def test_subagent_cannot_switch_branch(self):
+        e = Env()
+        try:
+            e.aq("init", "x")
+            e.aq("new", "x")
+            for cmd in ("git switch -c impl/x", "git checkout -b impl/x", "git branch impl/x", "git checkout main"):
+                with self.subTest(cmd=cmd):
+                    res = e.hook("pre-bash", {"tool_name": "Bash", "tool_input": {"command": cmd},
+                                              **e.agent_fields("implementer")})
+                    self.assertTrue(denied(res), cmd)
+            for cmd in ("git branch --show-current", "git checkout -- src/a.py", "git commit -m x", "git status"):
+                with self.subTest(cmd=cmd):
+                    res = e.hook("pre-bash", {"tool_name": "Bash", "tool_input": {"command": cmd},
+                                              **e.agent_fields("implementer")})
+                    self.assertFalse(denied(res), cmd)
+            res = e.hook("pre-bash", {"tool_name": "Bash", "tool_input": {"command": "git switch -c aq-dlc/x"}})
+            self.assertFalse(denied(res))  # 統括は作業ブランチを作れる
+        finally:
+            e.cleanup()
+
+
 if __name__ == "__main__":
     unittest.main()

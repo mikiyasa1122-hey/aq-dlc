@@ -12,9 +12,10 @@ import time
 
 from . import gate as G
 from .project import config, engine_cmd
-from .state import (ROLES, ROLE_LABEL, Ctx, artifacts_dir, bump, doc_hash, doc_path, graph_issues,
-                    id_index, iter_verifications, last_impl, latest_review, problems, run_dir,
+from .state import (ROLES, ROLE_LABEL, Ctx, artifacts_dir, bump, doc_hash, doc_path, gate_status,
+                    graph_issues, id_index, iter_verifications, last_impl, latest_review, problems, run_dir,
                     running_agents, save_state)
+from .util import load_json
 from .util import now_iso, read_text, short, write_text, is_within, norm
 
 PREFIX = "aq-dlc:"
@@ -555,9 +556,8 @@ def on_subagent_start(payload, project, state, spath):
         return None
     ctx = Ctx(project, state)
     aid = payload.get("agent_id") or f"{role}-{time.time()}"
-    g = state.get("gate") or {}
-    gate_ok = bool(g) and g.get("code_fp") == ctx.code_fp and g.get("checks_fp") == ctx.checks_fp \
-        and not [p for p in problems(ctx) if p["code"] in ("gate_missing", "gate_stale", "gate_fail")]
+    fresh, passing = gate_status(ctx)
+    gate_ok = fresh and passing
     kind, items = pending_fix(ctx) if role == "implementer" else (None, [])
     entry = {"role": role, "since": now_iso(), "epoch": time.time(), "start_seq": state.get("seq", 0),
              "code_fp_start": ctx.code_fp, "gate_ok_at_start": gate_ok, "blocks": 0,
@@ -665,6 +665,10 @@ REVIEWER_BASH_DENY = re.compile(
     r"|--update-snapshots|\s-u\b.*\b(jest|vitest)\b|\b(jest|vitest)\b.*\s-u\b")
 
 
+BRANCH_SWITCH = re.compile(r"\bgit\s+(?:-C\s+\S+\s+)?(switch\b|checkout\s+(-b|-B|--orphan)\b|checkout\s+[^-\s.][^\s]*\s*$"
+                           r"|branch\s+(?!--show-current|-a\b|-l\b|--list|-v|-vv|-r\b)\S)", re.M)
+
+
 def check_bash(role, cmd, project, state, cfg):
     if not cfg["automation"].get("enforce_roles", True):
         return None
@@ -686,9 +690,61 @@ def check_bash(role, cmd, project, state, cfg):
                      "impl-map": "implementer"}[sub]
             return (f"`{sub}` は {ROLE_LABEL[owner]} の担当です。統括は直接編集せず、"
                     f"Agent ツールで aq-dlc:{owner} に依頼してください。")
+    if role in ROLES and BRANCH_SWITCH.search(cmd):
+        return "サブエージェントはブランチを作成・切り替えできません（統括が作った作業ブランチで作業する）。"
     if role == "reviewer" and REVIEWER_BASH_DENY.search(cmd):
         return "独立レビュー担当は、ファイルやリポジトリを変更するコマンドを実行できません。"
     return None
+
+
+ACTOR_TTL = 600
+
+
+def caller_role(project, name):
+    """直前の Bash（PreToolUse hook が記録）が、このエンジンのコマンドを含んでいれば、その担当を返す。
+
+    変数や関数を経由した呼び出し（$AQ req ...）でも、Bash の本文にコマンド名が含まれるため判定できる。
+    hook が動いていない（人が端末から直接使う）場合は None（制限しない）。
+    """
+    rd = run_dir(project)
+    if not rd:
+        return None
+    a = load_json(os.path.join(rd, "actor.json"), {}) or {}
+    if time.time() - a.get("at", 0) > ACTOR_TTL:
+        return None
+    if not re.search(rf"(^|[\s\"'`;(|&]){re.escape(name)}([\s\"'`;)|&]|$)", a.get("cmd", "")):
+        return None
+    return a.get("role")
+
+
+def engine_policy(project, name, args, cfg):
+    """エンジン側の権限確認。戻り値: 拒否の理由（None なら許可）。"""
+    if not cfg["automation"].get("enforce_roles", True):
+        return None
+    role = caller_role(project, name)
+    if role is None:
+        return None
+    if role in ROLES:
+        if name not in ROLE_COMMANDS[role]:
+            return f"{ROLE_LABEL[role]} はエンジンの `{name}` を使えません（担当外のコマンド）。"
+        if name == "spec" and ("--present" in args or "--approve" in args):
+            return f"{ROLE_LABEL[role]} は仕様の提示・承認ができません（統括の担当）。"
+        return None
+    if name in WORK_COMMANDS:
+        return (f"`{name}` は統括の担当ではありません（担当のサブエージェントに Agent ツールで依頼してください）。")
+    return None
+
+
+def forged_hook(project, hook_name):
+    """Bash から hook を直接呼んで、人間の返答やサブエージェントの終了を偽装していないか。"""
+    rd = run_dir(project) if project else None
+    if not rd:
+        return False
+    a = load_json(os.path.join(rd, "actor.json"), {}) or {}
+    if time.time() - a.get("at", 0) > 60:
+        return False
+    cmd = a.get("cmd", "")
+    return bool(re.search(r"\bhook\b", cmd) and hook_name in cmd)
 
 
 def check_write(role, path, project, state, cfg):

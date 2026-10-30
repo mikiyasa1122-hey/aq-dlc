@@ -282,6 +282,27 @@ class Ctx:
         return G.code_fp(self.snap)
 
 
+def gate_status(ctx):
+    """(鮮度, 合否)。鮮度: 今のコード・チェック定義・各検証条件で実行された結果か。"""
+    s = ctx.state
+    g = s.get("gate")
+    if not g:
+        return False, False
+    vres = (g.get("results") or {}).get("verifications", {})
+    fresh = g.get("code_fp") == ctx.code_fp and g.get("checks_fp") == ctx.checks_fp
+    passing = bool(g.get("checks_pass"))
+    for _r, _p, v in iter_verifications(s):
+        r = vres.get(v["id"])
+        if r is None or r.get("fp") != G.verification_fp(v, ctx.cfg):
+            fresh = False
+            continue
+        if v.get("after_merge") or (v.get("manual") and not G.is_automated(v)):
+            continue
+        if not r.get("pass"):
+            passing = False
+    return fresh, passing
+
+
 # ------------------------------------------------------------------ problems / next
 def P(code, msg, route):
     return {"code": code, "msg": msg, "route": route}

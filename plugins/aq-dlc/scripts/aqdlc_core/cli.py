@@ -697,10 +697,10 @@ def hook_pre_bash(payload):
     if not project:
         return None
     cfg = config(project)
-    if state and A.ENGINE_RE.search(cmd):
+    if state:
         rd = run_dir(project, state.get("run_id"))
         if rd:
-            save_json(os.path.join(rd, "actor.json"), {"role": role, "at": time.time(), "cmd": cmd[:300]})
+            save_json(os.path.join(rd, "actor.json"), {"role": role, "at": time.time(), "cmd": cmd[:8000]})
     why = A.check_bash(role, cmd, project, state, cfg)
     if why:
         return A.deny(why)
@@ -752,6 +752,7 @@ def hook_user_prompt(payload):
     cwd, project, state, spath = hook_context(payload)
     if state and state.get("status") in ("in_progress", "pr_ready"):
         human_event(state, "prompt", payload.get("prompt") or "")
+        state["awaiting_human"] = False  # 人間が返答したので、確認待ちを解除する
         save_state(spath, state)
     return None
 
@@ -854,6 +855,11 @@ def run_hook(name):
     fn = HOOKS.get(name)
     if not fn:
         return
+    if name != "pre-bash":
+        cwd = payload.get("cwd") or os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+        if A.forged_hook(active_project_for(cwd), name):
+            print("[aq-dlc] Bash から hook を直接呼ぶことはできません。", file=sys.stderr)
+            return
     try:
         emit(fn(payload))
     except SystemExit:
@@ -906,4 +912,11 @@ def main(argv=None):
     if name not in COMMANDS:
         print(USAGE)
         sys.exit(2)
+    if name not in ("setup", "init", "create", "doctor", "help"):
+        peek = list(rest)
+        project = resolve_project(peek, required=False)
+        if project:
+            why = A.engine_policy(project, name, rest, config(project))
+            if why:
+                die(why)
     COMMANDS[name](rest)
