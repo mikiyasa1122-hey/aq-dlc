@@ -481,21 +481,40 @@ def cmd_gate(args):
     try:
         stamp = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
         info(f"gate {stamp}  ({project})")
-        before = ctx.snap
+        # 実行開始時のコード・チェック定義・検証条件（gate の結果はこれに紐付ける）
+        before = G.snapshot(project, cfg, (s.get("gate") or {}).get("snapshot"))
+        checks_fp_before = G.checks_fp(cfg)
+        vfp_before = {v["id"]: G.verification_fp(v, cfg) for _r, _p, v in iter_verifications(s)}
+        t0 = time.time()
         results, ok = G.run_gate(project, s, cfg, iter_verifications, os.path.join(ctx.rd, "gate"), stamp,
                                  after_merge)
-        after = G.snapshot(project, cfg, before)
+        dur = round(time.time() - t0, 1)
+        cfg_after = config(project)
+        after = G.snapshot(project, cfg_after, before)
     finally:
         try:
             os.remove(lock)
         except OSError:
             pass
     s, spath = load_state(project)  # gate 実行中に他の記録が入っていてもよいように読み直す
-    modified = G.describe_diff(before, after)
-    s["gate"] = {"seq": bump(s), "stamp": stamp, "ran_at": now_iso(), "after_merge": after_merge,
-                 "code_fp": G.code_fp(after), "snapshot": after, "checks_fp": G.checks_fp(cfg),
-                 "graph_fp": ctx.graph_fp, "checks_pass": ok, "results": results,
-                 "modified_during_gate": modified or None}
+    c, a, r = G.snapshot_diff(before, after)
+    changed_defs = []
+    if G.checks_fp(cfg_after) != checks_fp_before:
+        changed_defs.append("チェックの定義")
+    vfp_after = {v["id"]: G.verification_fp(v, cfg_after) for _r, _p, v in iter_verifications(s)}
+    if vfp_after != vfp_before:
+        changed_defs.append("検証条件")
+    modified = None
+    if c or a or r or changed_defs:
+        modified = {"files": c + a + r, "changed": c, "added": a, "removed": r, "definitions": changed_defs,
+                    "summary": G.describe_diff(before, after) or "、".join(changed_defs)}
+        ok = False  # 検証したものと結果を紐付けるものが一致しないため不合格
+    s["gate"] = {"seq": bump(s), "stamp": stamp, "ran_at": now_iso(), "after_merge": after_merge, "sec": dur,
+                 "code_fp": G.code_fp(before), "code_fp_after": G.code_fp(after), "snapshot": before,
+                 "checks_fp": checks_fp_before, "graph_fp": ctx.graph_fp, "checks_pass": ok, "results": results,
+                 "modified_during_gate": modified}
+    s.setdefault("gate_history", []).append({"stamp": stamp, "pass": ok, "sec": dur, "after_merge": after_merge,
+                                             "modified": bool(modified)})
     if after_merge:
         s["after_merge_gate"] = True
     s["stop_blocks"] = 0
@@ -504,7 +523,13 @@ def cmd_gate(args):
     if not cfg.get("checks"):
         print("  ! チェックが登録されていません（完了条件を満たせません）")
     if modified:
-        print(f"  ! gate の実行中にファイルが変わりました: {modified}（テストが追跡対象のファイルを書き換えていないか確認）")
+        print(f"  ! gate の実行中に変更がありました: {modified['summary']}")
+        print("    検証したものと結果を紐付けるものが一致しないため、gate を不合格にしました。"
+              "テストやビルドが追跡対象のファイルを書き換えていないか確認してください。")
+        log_dir = os.path.join(ctx.rd, "gate")
+        write_text(os.path.join(log_dir, f"{stamp}-modified.log"),
+                   "\n".join(["gate の実行中に変わったもの"] + [f"変更: {x}" for x in c] + [f"追加: {x}" for x in a]
+                             + [f"削除: {x}" for x in r] + [f"定義: {x}" for x in changed_defs]) + "\n")
     info(f"gate 結果: {'合格' if ok else '不合格'}")
 
 
@@ -704,6 +729,14 @@ def hook_pre_bash(payload):
     why = A.check_bash(role, cmd, project, state, cfg)
     if why:
         return A.deny(why)
+    # 実装担当以外の Bash は、実行前のコードの状態を記録しておき、実行後に変更がないか確かめる
+    if state and state.get("status") in ("in_progress", "pr_ready") and role != "implementer" \
+            and cfg["automation"].get("enforce_roles", True):
+        rd = run_dir(project, state.get("run_id"))
+        if rd:
+            prev = (state.get("gate") or {}).get("snapshot")
+            save_json(A.bash_snapshot_path(rd, payload.get("tool_use_id")),
+                      {"role": role, "cmd": cmd[:2000], "snapshot": G.snapshot(project, cfg, prev)})
     if re.search(r"\b(git|gh)\b|api\.github\.com", cmd):
         try:
             reasons = gitops.guard_reasons(cmd, project, gitops.current_branch, gitops.remote_has_branch)
@@ -716,6 +749,41 @@ def hook_pre_bash(payload):
     return None
 
 
+def hook_post_bash(payload):
+    """実装担当以外の Bash がコードやテストを変えていないか（リダイレクト・スクリプト・変数展開などの手段を問わず検出）。"""
+    cwd, project, state, spath = hook_context(payload)
+    if not project or not state:
+        return None
+    rd = run_dir(project, state.get("run_id"))
+    if not rd:
+        return None
+    snap_path = A.bash_snapshot_path(rd, payload.get("tool_use_id"))
+    pre = load_json(snap_path, None)
+    if not pre:
+        return None
+    try:
+        os.remove(snap_path)
+    except OSError:
+        pass
+    cfg = config(project)
+    after = G.snapshot(project, cfg, pre["snapshot"])
+    v = A.detect_bash_changes(pre["role"], pre["cmd"], pre["snapshot"], after, project)
+    if not v:
+        return None
+    state, spath = load_state(project)
+    v["seq"] = bump(state)
+    state.setdefault("violations", []).append(v)
+    save_state(spath, state)
+    who = ROLE_LABEL.get(pre["role"], "統括")
+    reason = (f"AQ-DLC: 担当外の変更を検出しました（{who} の Bash で {v['count']} 件: {', '.join(v['files'][:5])}）。"
+              "run の実行中にコードやテストを変えられるのは実装担当だけです。この変更は記録され、"
+              "実装担当が内容を確認・取り込み、gate と独立レビューをやり直すまで、レビュー・完了に進めません。")
+    if v["kind"] == "git":
+        reason += "（git の操作による作業ツリーの変化も、取り込みの確認が必要です）"
+    return {"decision": "block", "reason": reason,
+            "hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": reason}}
+
+
 def hook_pre_write(payload):
     ti = payload.get("tool_input") or {}
     path = ti.get("file_path") or ti.get("notebook_path") or ti.get("path")
@@ -724,6 +792,7 @@ def hook_pre_write(payload):
         return None
     if not os.path.isabs(path):
         path = os.path.join(cwd, path)
+    project = os.path.realpath(project)
     why = A.check_write(A.role_of(payload.get("agent_type")), path, project, state, config(project))
     return A.deny(why) if why else None
 
@@ -843,6 +912,7 @@ def hook_session_start(payload):
 HOOKS = {
     "session-start": hook_session_start, "user-prompt": hook_user_prompt, "pre-bash": hook_pre_bash,
     "pre-write": hook_pre_write, "pre-agent": hook_pre_agent, "post-ask": hook_post_ask,
+    "post-bash": hook_post_bash,
     "subagent-start": hook_subagent_start, "subagent-stop": hook_subagent_stop, "stop": hook_stop,
 }
 LEGACY_HOOKS = {"stop-hook": "stop", "guard-hook": "pre-bash", "session-hook": "session-start",

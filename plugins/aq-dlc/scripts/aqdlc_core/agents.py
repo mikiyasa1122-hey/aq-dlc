@@ -13,8 +13,9 @@ import time
 from . import gate as G
 from .project import config, engine_cmd
 from .state import (ROLES, ROLE_LABEL, Ctx, artifacts_dir, bump, doc_hash, doc_path, gate_status,
-                    graph_issues, id_index, iter_verifications, last_impl, latest_review, problems, run_dir,
-                    running_agents, save_state)
+                    current_review, graph_issues, id_index, iter_verifications, last_impl, latest_review, problems,
+                    review_passed,
+                    run_dir, running_agents, save_state)
 from .util import load_json
 from .util import now_iso, read_text, short, write_text, is_within, norm
 
@@ -84,17 +85,29 @@ REQUIRED = {
 def pending_fix(ctx):
     """実装担当に今回求める修正（レビュー指摘・gate 不合格・CI 不合格）。"""
     s = ctx.state
-    rv = latest_review(s)
+    rv = current_review(s)
     li = last_impl(s)
     items, kind = [], None
-    if rv and rv.get("blocking", 0) > 0 and (not li or li["seq"] < rv["seq"]):
+    if li and li.get("code_fp") and li["code_fp"] != ctx.code_fp:
+        c, a, r = G.snapshot_diff(li.get("snapshot") or {}, ctx.snap)
+        kind = ("unowned", li["n"])
+        items = [{"label": f"担当外{i + 1}", "text": f"{f}（実装担当以外の操作で変更・追加・削除された。"
+                  "内容を確認し、正しければ取り込み、不要なら元に戻す）"} for i, f in enumerate((c + a + r)[:20])]
+        if not items:
+            items = [{"label": "担当外1", "text": "実装担当以外の操作でコードが変わった（git diff で確認する）"}]
+        return kind, items
+    if rv and not review_passed(rv) and (not li or li["seq"] < rv["seq"]):
         kind = ("review", rv["n"])
-        items = [f for f in rv.get("findings", []) if f.get("severity") == "重大"]
+        items = [f for f in rv.get("findings", []) if f.get("severity") == "重大"] or rv.get("findings", [])
     g = s.get("gate")
     if not kind and g and (not li or li["seq"] < g["seq"]):
         failed = [(n, r) for n, r in g["results"]["checks"].items() if not r["pass"]]
         vfail = [(n, r) for n, r in g["results"]["verifications"].items()
                  if not r.get("pass") and not r.get("pending_after_merge") and not r.get("manual")]
+        md = g.get("modified_during_gate")
+        if md:
+            failed = [("gate中の変更", {"error": f"gate の実行中に変わった: {md.get('summary')}（テスト・ビルドが追跡対象の"
+                                              "ファイルを書き換えないようにする）"})] + failed
         if failed or vfail:
             kind = ("gate", g["stamp"])
             items = [{"label": n, "text": r.get("skipped") or r.get("error") or f"不合格（ログ: {r.get('log')}）"}
@@ -344,7 +357,8 @@ def spawn_problem(role, ctx):
         if design_block:
             return "設計が揃っていないため、レビューできません: " + design_block[0]["msg"]
         pre = [p for p in probs if p["code"] in ("impl_missing", "impl_stale", "impl_untraced", "verif_unbound",
-                                                 "review_fix", "gate_missing", "gate_stale", "gate_fail")]
+                                                 "code_unowned", "review_fix", "gate_missing", "gate_stale",
+                                                 "gate_fail", "gate_modified")]
         if pre:
             return "Quality Gate を通過した最新の実装がないため、レビューできません: " + pre[0]["msg"]
         return None
@@ -354,8 +368,9 @@ def spawn_problem(role, ctx):
 # ------------------------------------------------------------------ report parsing
 def parse_review(text):
     t = text or ""
-    m = re.search(r"判定\s*[:：]\s*\**\s*(合格|要修正)", t)
-    verdict = m.group(1) if m else None
+    m = re.search(r"判定\s*[:：]\s*\**\s*([^\s*｜|/]+)", t)
+    raw_verdict = m.group(1).strip() if m else None
+    verdict = raw_verdict if raw_verdict in ("合格", "要修正") else None
     m = re.search(r"重大な指摘\s*[:：]\s*\**\s*(\d+)", t)
     head_block = int(m.group(1)) if m else None
     m = re.search(r"軽微な指摘\s*[:：]\s*\**\s*(\d+)", t)
@@ -378,18 +393,23 @@ def parse_review(text):
     missing = bullet_items(section(t, "不足しているリスク"))
     blocking_entries = sum(1 for f in findings if f["severity"] == "重大")
     errors = []
-    if verdict is None:
-        errors.append("「判定: 合格 / 要修正」の行がない")
+    if raw_verdict is None:
+        errors.append("「判定: 合格 または 要修正」の行がない")
+    elif verdict is None:
+        errors.append(f"判定「{raw_verdict}」は不正（「合格」か「要修正」のどちらか）")
     if head_block is None:
         errors.append("「重大な指摘: <数>」の行がない")
     blocking = max(head_block or 0, blocking_entries)
     if head_block is not None and head_block != blocking_entries:
         errors.append(f"重大な指摘の数（{head_block}）と [重大n] の項目数（{blocking_entries}）が一致しない")
+    minor = max(head_minor, sum(1 for f in findings if f["severity"] == "軽微"))
     if verdict == "合格" and blocking > 0:
-        verdict = "要修正"
-    return {"verdict": verdict or "要修正", "blocking": blocking, "minor": max(head_minor,
-            sum(1 for f in findings if f["severity"] == "軽微")), "findings": findings,
-            "missing_risks": missing}, errors
+        errors.append(f"判定「合格」と重大な指摘 {blocking} 件が矛盾している（重大があれば「要修正」）")
+    if verdict == "要修正" and not findings:
+        errors.append("判定「要修正」なのに指摘が1件もない（何を直すのかを [重大n] / [軽微n] で書く）")
+    passed = verdict == "合格" and blocking == 0 and not errors
+    return {"verdict": verdict, "raw_verdict": raw_verdict, "blocking": blocking, "minor": minor,
+            "findings": findings, "missing_risks": missing, "passed": passed}, errors
 
 
 # ------------------------------------------------------------------ validation at SubagentStop
@@ -461,6 +481,24 @@ def validate(role, ctx, entry, message):
     elif role == "reviewer":
         _rec, perrs = parse_review(message)
         errs += perrs
+        sec = section(message, "受け入れ条件ごとの検証の妥当性")
+        if sec is None:
+            errs.append("「### 受け入れ条件ごとの検証の妥当性」の節がない")
+        else:
+            need = [a["id"] for r in s["requirements"] for a in r.get("acceptance", [])]
+            need += [k["id"] for r in s["requirements"] if r.get("critical") for k in r.get("risks", [])]
+            miss = [i for i in need if not re.search(rf"(?<![A-Za-z0-9_.-]){re.escape(i)}(?![A-Za-z0-9_.-])", sec)]
+            if miss:
+                errs.append("「受け入れ条件ごとの検証の妥当性」で評価していない受け入れ条件・重要なリスク: "
+                            + "、".join(miss[:10]))
+        e2e = section(message, "E2E の要否")
+        if e2e is None or not e2e.strip():
+            errs.append("「### E2E の要否」の節がない（必要か・不要ならその理由）")
+        sig = entry.get("test_signals") or []
+        unmentioned = [x["file"] for x in sig if x["file"] not in (message or "")]
+        if unmentioned:
+            errs.append("エンジンが検出したテストの兆候（skip・アサーションなしなど）に触れていないファイル: "
+                        + "、".join(sorted(set(unmentioned))[:8]))
     return errs
 
 
@@ -484,7 +522,8 @@ def register(role, ctx, entry, message):
         rounds = s["impl"]["rounds"]
         n = len(rounds) + 1
         fix = entry.get("fix") or {}
-        rec = {"n": n, "seq": seq, "at": now_iso(), "code_fp": ctx.code_fp, "design_hash": ctx.design_hash,
+        rec = {"n": n, "seq": seq, "at": now_iso(), "code_fp": ctx.code_fp, "snapshot": ctx.snap,
+               "design_hash": ctx.design_hash,
                "spec_hash": ctx.spec_hash, "report_hash": doc_hash(rd, "impl"), "fix": fix or None}
         rounds.append(rec)
         if fix:
@@ -508,6 +547,9 @@ def register(role, ctx, entry, message):
             invalid = "報告の形式が不正（" + "、".join(entry["format_errors"][:2]) + "）"
         elif not entry.get("gate_ok_at_start"):
             invalid = "最新のコードで Quality Gate を通過していない状態でレビューが始まった"
+        if invalid is None and rec.get("verdict") is None:
+            invalid = "判定を読み取れない"
+        rec["passed"] = bool(rec.get("passed")) and invalid is None
         rec.update({"n": n, "seq": seq, "at": now_iso(), "code_fp": code_now, "graph_fp": ctx.graph_fp,
                     "checks_fp": ctx.checks_fp, "spec_hash": ctx.spec_hash, "design_hash": ctx.design_hash,
                     "gate_stamp": (s.get("gate") or {}).get("stamp"), "report": os.path.relpath(path, ctx.project),
@@ -515,7 +557,8 @@ def register(role, ctx, entry, message):
         s["reviews"].append(rec)
         if invalid:
             return f"レビュー#{n} は無効（{invalid}）"
-        return f"レビュー#{n}: {rec['verdict']}（重大 {rec['blocking']} 件・軽微 {rec['minor']} 件）"
+        return f"レビュー#{n}: {rec['verdict']}（重大 {rec['blocking']} 件・軽微 {rec['minor']} 件）" + \
+            ("" if rec["passed"] else "→ 完了不可（修正ループ）")
     return ""
 
 
@@ -747,6 +790,35 @@ def forged_hook(project, hook_name):
     return bool(re.search(r"\bhook\b", cmd) and hook_name in cmd)
 
 
+def real_target(path):
+    """存在しないファイルでも、存在する親までたどって実体のパスを求める。"""
+    head, tail = os.path.abspath(path), []
+    while head and not os.path.exists(head):
+        head, t = os.path.split(head)
+        if not t:
+            break
+        tail.append(t)
+    return os.path.join(os.path.realpath(head), *reversed(tail)) if head else path
+
+
+# ------------------------------------------------------------------ Bash の前後でのファイル変更の検出
+def bash_snapshot_path(rd, tool_use_id):
+    safe = re.sub(r"[^A-Za-z0-9_-]", "_", tool_use_id or "last")[:80]
+    return os.path.join(rd, "tmp", f"bash-{safe}.json")
+
+
+GIT_SYNC = re.compile(r"\bgit\s+(?:-C\s+\S+\s+)?(switch|checkout|pull|merge|rebase|reset|stash|restore|cherry-pick|revert|am)\b")
+
+
+def detect_bash_changes(role, cmd, before, after, project):
+    c, a, r = G.snapshot_diff(before, after)
+    files = c + a + r
+    if not files:
+        return None
+    return {"role": role, "at": now_iso(), "cmd": cmd[:500], "files": files[:50], "count": len(files),
+            "kind": "git" if GIT_SYNC.search(cmd) else "write"}
+
+
 def check_write(role, path, project, state, cfg):
     if not path:
         return None
@@ -755,6 +827,9 @@ def check_write(role, path, project, state, cfg):
     auto = cfg["automation"]
     if role == "reviewer":
         return "独立レビュー担当はファイルを変更できません。"
+    # シンボリックリンクをたどった実体で判定する（リンク経由でプロジェクト内を書き換えるのを防ぐ）
+    path = real_target(path)
+    project = os.path.realpath(project)
     if not is_within(path, project):
         return None
     rel = os.path.relpath(norm(path), norm(project)).replace(os.sep, "/")

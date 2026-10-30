@@ -3,14 +3,22 @@
     "SessionStart": [
       {
         "hooks": [
-          {"type": "command", "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/aqdlc.py\" hook session-start", "timeout": 20}
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/aqdlc.py\" hook session-start",
+            "timeout": 20
+          }
         ]
       }
     ],
     "UserPromptSubmit": [
       {
         "hooks": [
-          {"type": "command", "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/aqdlc.py\" hook user-prompt", "timeout": 15}
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/aqdlc.py\" hook user-prompt",
+            "timeout": 15
+          }
         ]
       }
     ],
@@ -18,19 +26,31 @@
       {
         "matcher": "Bash",
         "hooks": [
-          {"type": "command", "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/aqdlc.py\" hook pre-bash", "timeout": 30}
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/aqdlc.py\" hook pre-bash",
+            "timeout": 30
+          }
         ]
       },
       {
         "matcher": "Write|Edit|MultiEdit|NotebookEdit",
         "hooks": [
-          {"type": "command", "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/aqdlc.py\" hook pre-write", "timeout": 15}
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/aqdlc.py\" hook pre-write",
+            "timeout": 15
+          }
         ]
       },
       {
         "matcher": "Agent|Task",
         "hooks": [
-          {"type": "command", "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/aqdlc.py\" hook pre-agent", "timeout": 60}
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/aqdlc.py\" hook pre-agent",
+            "timeout": 60
+          }
         ]
       }
     ],
@@ -38,28 +58,54 @@
       {
         "matcher": "AskUserQuestion",
         "hooks": [
-          {"type": "command", "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/aqdlc.py\" hook post-ask", "timeout": 15}
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/aqdlc.py\" hook post-ask",
+            "timeout": 15
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/aqdlc.py\" hook post-bash",
+            "timeout": 60
+          }
         ]
       }
     ],
     "SubagentStart": [
       {
         "hooks": [
-          {"type": "command", "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/aqdlc.py\" hook subagent-start", "timeout": 60}
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/aqdlc.py\" hook subagent-start",
+            "timeout": 60
+          }
         ]
       }
     ],
     "SubagentStop": [
       {
         "hooks": [
-          {"type": "command", "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/aqdlc.py\" hook subagent-stop", "timeout": 120}
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/aqdlc.py\" hook subagent-stop",
+            "timeout": 120
+          }
         ]
       }
     ],
     "Stop": [
       {
         "hooks": [
-          {"type": "command", "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/aqdlc.py\" hook stop", "timeout": 60}
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/aqdlc.py\" hook stop",
+            "timeout": 60
+          }
         ]
       }
     ]

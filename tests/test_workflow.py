@@ -45,7 +45,7 @@ class WorkflowTest(unittest.TestCase):
         self.assertTrue(os.path.exists(os.path.join(e.arts, "review-1.md")))
         nxt = e.next()
         self.assertIn("実装", nxt)
-        self.assertIn("重大な指摘", nxt)
+        self.assertIn("要修正", nxt)
         # 修正: 指摘への対応がないと終了できない
         self.assertFalse(denied(e.spawn("implementer")))
         brief = e.start("implementer")["hookSpecificOutput"]["additionalContext"]

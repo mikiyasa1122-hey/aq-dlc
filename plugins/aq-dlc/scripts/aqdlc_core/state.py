@@ -308,6 +308,21 @@ def P(code, msg, route):
     return {"code": code, "msg": msg, "route": route}
 
 
+def review_passed(rv):
+    """レビューが「合格」で、重大な指摘が0件で、形式が正しいときだけ True（読み取れない・矛盾は不合格）。"""
+    if not rv or not rv.get("valid"):
+        return False
+    if "passed" in rv:
+        return bool(rv["passed"])
+    return rv.get("verdict") == "合格" and rv.get("blocking", 0) == 0  # 旧形式の記録
+
+
+def current_review(state):
+    """最新のレビュー（有効なものに限る）。最新が無効なら、それより前の合格は使わない（安全側）。"""
+    rs = state.get("reviews", [])
+    return rs[-1] if rs and rs[-1].get("valid") else None
+
+
 def latest_review(state):
     rv = [r for r in state.get("reviews", []) if r.get("valid")]
     return rv[-1] if rv else None
@@ -404,6 +419,11 @@ def problems(ctx, stage="pr"):
     if li.get("design_hash") != ctx.design_hash or li.get("spec_hash") != ctx.spec_hash:
         out.append(P("impl_stale", "仕様・設計の変更後に実装が更新されていない", "implementer"))
         return out
+    if li.get("code_fp") and li["code_fp"] != ctx.code_fp:
+        diff = G.describe_diff(li.get("snapshot"), ctx.snap) if li.get("snapshot") else ""
+        out.append(P("code_unowned", "実装担当の登録後に、実装担当以外の操作でコードが変わった"
+                     + (f"（{diff}）" if diff else "") + "。実装担当に内容の確認と取り込みを依頼する", "implementer"))
+        return out
     untraced = []
     for r in s["requirements"]:
         files = s["impl"]["map"].get(r["id"]) or []
@@ -420,15 +440,17 @@ def problems(ctx, stage="pr"):
     if out:
         return out
 
-    rv = latest_review(s)
-    if rv and rv.get("blocking", 0) > 0:
-        cats = {f.get("category") for f in rv.get("findings", []) if f.get("severity") == "重大"}
+    rv = current_review(s)
+    if rv and not review_passed(rv):
+        cats = {f.get("category") for f in rv.get("findings", []) if f.get("severity") == "重大"} or \
+            {f.get("category") for f in rv.get("findings", [])}
         if "仕様" in cats and spec.get("registered_seq", 0) < rv["seq"]:
             out.append(P("review_fix", f"レビュー#{rv['n']} の重大な指摘（仕様）が未対応", "requirements"))
         elif "設計" in cats and d.get("registered_seq", 0) < rv["seq"]:
             out.append(P("review_fix", f"レビュー#{rv['n']} の重大な指摘（設計）が未対応", "design"))
         elif li["seq"] < rv["seq"]:
-            out.append(P("review_fix", f"レビュー#{rv['n']} の重大な指摘 {rv['blocking']} 件が未対応",
+            out.append(P("review_fix", f"レビュー#{rv['n']} が「{rv.get('verdict')}」（重大 {rv['blocking']} 件・"
+                         f"軽微 {rv.get('minor', 0)} 件）。指摘が未対応",
                          fix_route("implementer")))
         if out:
             return out
@@ -457,6 +479,11 @@ def problems(ctx, stage="pr"):
         stale.append(f"結果のない検証（{', '.join(new_v[:5])}）")
     if stale:
         out.append(P("gate_stale", "gate 後に変わったものがある: " + "、".join(stale), "gate"))
+        return out
+    md = g.get("modified_during_gate")
+    if md:
+        out.append(P("gate_modified", f"gate の実行中に変更があった（{md.get('summary')}）。この gate の結果は使えない",
+                     "gate" if li["seq"] > g["seq"] else fix_route("implementer")))
         return out
     failed = [n for n, r in g["results"]["checks"].items() if not r["pass"]]
     vfail = []
@@ -493,8 +520,9 @@ def problems(ctx, stage="pr"):
         out.append(P("review_stale", f"レビュー#{rv['n']} の後に {'・'.join(rs)} が変わった（再レビューが必要）",
                      "reviewer"))
         return out
-    if rv.get("blocking", 0) > 0:
-        out.append(P("review_blocking", f"レビュー#{rv['n']} の重大な指摘 {rv['blocking']} 件が残っている",
+    if not review_passed(rv):
+        out.append(P("review_blocking", f"レビュー#{rv['n']} が合格ではない（判定「{rv.get('verdict')}」・"
+                     f"重大 {rv['blocking']} 件）。修正して再レビューが必要",
                      fix_route("implementer")))
         return out
 
@@ -705,8 +733,15 @@ def describe_state(ctx):
         f"  登録{'済み' if d.get('registered_hash') and d.get('registered_hash') == ctx.design_hash else 'なし'}",
         f"実装: {('第' + str(li['n']) + '回') if li else '未着手'}  修正回数: {s.get('fix_iterations', 0)}",
         f"コード: {short(ctx.code_fp)}  チェック: {len(ctx.checks)}件",
-        f"レビュー: {('#' + str(rv['n']) + ' ' + rv['verdict'] + ' 重大' + str(rv['blocking'])) if rv else '未実施'}",
+        f"レビュー: {('#' + str(rv['n']) + ' ' + str(rv.get('verdict')) + ' 重大' + str(rv['blocking'])) if rv else '未実施'}",
     ]
+    g = s.get("gate") or {}
+    if g.get("modified_during_gate"):
+        lines.append(f"  ! 最後の gate（{g.get('stamp')}）は、gate の実行中に変更があったため不合格: "
+                     f"{g['modified_during_gate'].get('summary')}")
+    vio = s.get("violations") or []
+    if vio:
+        lines.append(f"  ! 担当外の変更の記録: {len(vio)} 件（最新: {vio[-1]['role']} の Bash で {vio[-1]['count']} 件）")
     bad = [r for r in s.get("reviews", []) if not r.get("valid")]
     if bad and (not rv or bad[-1]["n"] > rv["n"]):
         lines.append(f"  ! 最後のレビュー#{bad[-1]['n']} は無効: {bad[-1].get('invalid_reason')}")

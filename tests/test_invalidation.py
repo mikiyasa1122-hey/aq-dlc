@@ -6,7 +6,7 @@ import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from helpers import REVIEW_PASS, Env, build_to_review, edit_json  # noqa: E402
+from helpers import REVIEW_PASS, Env, build_to_review, edit_json, read_file, write_file  # noqa: E402
 
 
 def finish_review(e):
@@ -34,9 +34,18 @@ class InvalidationTest(unittest.TestCase):
     def test_code_change(self):
         with open(os.path.join(self.e.project, "src", "memo.py"), "a", encoding="utf-8") as f:
             f.write("# x\n")
-        self.assert_stale(["gate 後に変わったものがある", "コード", "src/memo.py"])
-        # gate をやり直しても、レビューは古いまま
-        self.e.aq("gate")
+        # 実装担当以外の変更は、まず実装担当の取り込みが必要
+        self.assert_stale(["実装担当以外の操作でコードが変わった", "src/memo.py"])
+        e = self.e
+        e.spawn("implementer")
+        brief = e.start("implementer")["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("src/memo.py", brief)
+        p = os.path.join(e.arts, "impl.md")
+        write_file(p, read_file(p) + "\n## 指摘への対応\n- [担当外1] 追加された行を確認して取り込んだ\n")
+        self.assertIsNone(e.stop("implementer", "取り込み"))
+        # 取り込み後: gate は古い → gate をやり直しても、レビューは古いまま
+        self.assert_stale(["gate 後に変わったものがある", "コード"])
+        e.aq("gate")
         self.assert_stale(["再レビュー", "コード"])
 
     def test_mtime_only_change_is_not_stale(self):

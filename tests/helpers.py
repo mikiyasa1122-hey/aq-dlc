@@ -204,6 +204,12 @@ REVIEW_FAIL = """## レビュー結果
 ### 指摘
 - [重大1] 区分: 実装 / 対象: R1, V2 / 内容: 空白だけのメモが保存される / 根拠: src/memo.py:3 / 提案: strip して判定
 - [軽微1] 区分: テスト / 対象: V1 / 内容: テスト名が分かりにくい
+### 受け入れ条件ごとの検証の妥当性
+- AC1: V1 は追加後の一覧を確認しており妥当
+- AC2: V3 は全テストの実行で妥当
+- K1: V2 は空のメモの拒否を確認しており妥当
+### E2E の要否
+- 不要（画面を持たないライブラリのため）
 ### 不足しているリスク
 - なし
 ### 確認したこと
@@ -217,6 +223,12 @@ REVIEW_PASS = """## レビュー結果
 レビュー対象: 仕様 x / 設計 y / コード z
 ### 指摘
 - なし
+### 受け入れ条件ごとの検証の妥当性
+- AC1: V1 は追加後の一覧を確認しており妥当
+- AC2: V3 は全テストの実行で妥当
+- K1: V2 は空のメモの拒否を確認しており妥当
+### E2E の要否
+- 不要（画面を持たないライブラリのため）
 ### 不足しているリスク
 - なし
 ### 確認したこと
@@ -340,3 +352,18 @@ def edit_json(path, fn):
     fn(data)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False)
+
+
+def bash_as(e, role, cmd, tool_use_id="t1"):
+    """Bash ツールの流れを模擬する: PreToolUse(Bash) → シェルで実行 → PostToolUse(Bash)。
+
+    戻り値: (pre の結果, post の結果)。pre で拒否されたらシェルは実行しない。
+    """
+    payload = {"tool_name": "Bash", "tool_input": {"command": cmd}, "tool_use_id": tool_use_id,
+               **e.agent_fields(role)}
+    pre = e.hook("pre-bash", payload)
+    if denied(pre):
+        return pre, None
+    subprocess.run(cmd, shell=True, cwd=e.project, env=e.env, capture_output=True)
+    post = e.hook("post-bash", dict(payload, tool_response={"stdout": "", "stderr": ""}))
+    return pre, post
