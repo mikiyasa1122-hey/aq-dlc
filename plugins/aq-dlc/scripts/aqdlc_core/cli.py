@@ -884,7 +884,8 @@ def hook_post_bash(payload):
             same = dict(cfg, gate=dict(cfg["gate"], ignore_dirs=pre.get("ignore_dirs", cfg["gate"]["ignore_dirs"])))
             # 変更の比較は ctime・inode 付きのキャッシュで十分（utime で ctime は戻せない）。
             # 全ファイルのハッシュのし直しは、判定と登録の時点で行う（hook の時間制限を超えないため）
-            after = G.snapshot(project, same, pre["snapshot"])
+            # Windows の ctime は作成時刻で書き換えを表さないため、Windows では全ファイルをハッシュし直す
+            after = G.snapshot(project, same, pre["snapshot"], fresh=(os.name == "nt"))
             c, a, r = G.snapshot_diff(pre["snapshot"], after)
             files = c + a + r
         if (not files and not notes) or (not active and not notes):
