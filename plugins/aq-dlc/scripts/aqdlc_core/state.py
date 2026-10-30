@@ -155,7 +155,9 @@ def new_run(project, title):
             rid = f"{base}-{n}"
     os.makedirs(os.path.join(d, "gate"), exist_ok=True)
     os.makedirs(artifacts_dir(d), exist_ok=True)
-    save_state(os.path.join(d, "state.json"), empty_state(rid, title))
+    st = empty_state(rid, title)
+    st["config_fp_registered"] = G.config_fp(config(project))
+    save_state(os.path.join(d, "state.json"), st)
     tmpl = read_text(os.path.join(project, ".aq-dlc", "run-template.md"), "# {title}\n")
     with open(os.path.join(d, "run.md"), "w", encoding="utf-8") as f:
         f.write(tmpl.replace("{title}", title).replace("{run_id}", rid).replace("{date}", now_iso()))
@@ -259,9 +261,11 @@ def graph_fp(state):
 class Ctx:
     """現在の仕様・設計・コード・検証条件の指紋をまとめて計算する。"""
 
-    def __init__(self, project, state, cfg=None):
+    def __init__(self, project, state, cfg=None, fresh=False):
         self.project, self.state = project, state
+        self.fresh = fresh  # True: キャッシュを使わずに全ファイルをハッシュし直す（判定・登録の時点）
         self.cfg = cfg or config(project)
+        self.config_fp = G.config_fp(self.cfg)
         self.rd = run_dir(project, state.get("run_id"))
         self.spec_hash = spec_hash(state, self.rd)
         self.design_hash = doc_hash(self.rd, "design")
@@ -274,7 +278,7 @@ class Ctx:
     def snap(self):
         if self._snap is None:
             prev = (self.state.get("gate") or {}).get("snapshot")
-            self._snap = G.snapshot(self.project, self.cfg, prev)
+            self._snap = G.snapshot(self.project, self.cfg, prev, fresh=self.fresh)
         return self._snap
 
     @property
@@ -306,6 +310,10 @@ def gate_status(ctx):
 # ------------------------------------------------------------------ problems / next
 def P(code, msg, route):
     return {"code": code, "msg": msg, "route": route}
+
+
+def open_violations(state):
+    return [v for v in state.get("violations", []) if not v.get("resolved")]
 
 
 def review_passed(rv):
@@ -354,6 +362,11 @@ def problems(ctx, stage="pr"):
     s, cfg = ctx.state, ctx.cfg
     auto = cfg["automation"]
     out = []
+    reg = s.get("config_fp_registered")
+    if reg and reg != ctx.config_fp:
+        out.append(P("config_changed", "設定（.aq-dlc/config.json または ~/.aq-dlc/config.json）がエンジンのコマンド以外で"
+                     "変更された（指紋の対象・自動化の境界・チェックが変わった可能性）", "human"))
+        return out
     _idx, dups = id_index(s)
     if dups:
         out.append(P("dup_ids", f"IDが重複している: {', '.join(dups)}（結果が上書きされるため判定できない）",
@@ -415,6 +428,8 @@ def problems(ctx, stage="pr"):
     li = last_impl(s)
     if not li:
         out.append(P("impl_missing", "実装が未着手", "implementer"))
+        if open_violations(s):
+            out[-1]["msg"] += "（実装の前に担当外の変更の記録がある。実装担当が確認して取り込む）"
         return out
     if li.get("design_hash") != ctx.design_hash or li.get("spec_hash") != ctx.spec_hash:
         out.append(P("impl_stale", "仕様・設計の変更後に実装が更新されていない", "implementer"))
@@ -422,7 +437,14 @@ def problems(ctx, stage="pr"):
     if li.get("code_fp") and li["code_fp"] != ctx.code_fp:
         diff = G.describe_diff(li.get("snapshot"), ctx.snap) if li.get("snapshot") else ""
         out.append(P("code_unowned", "実装担当の登録後に、実装担当以外の操作でコードが変わった"
-                     + (f"（{diff}）" if diff else "") + "。実装担当に内容の確認と取り込みを依頼する", "implementer"))
+                     + (f"（{diff}）" if diff else "") + "。実装担当に内容の確認と取り込みを依頼する",
+                     fix_route("implementer")))
+        return out
+    openv = open_violations(s)
+    if openv:
+        files = sorted({f for v in openv for f in v.get("files", [])})
+        out.append(P("violation_open", f"未対応の担当外の変更の記録が {len(openv)} 件ある（{', '.join(files[:3]) or '対象不明'}）。"
+                     "実装担当に確認と取り込みを依頼する", fix_route("implementer")))
         return out
     untraced = []
     for r in s["requirements"]:
@@ -465,6 +487,8 @@ def problems(ctx, stage="pr"):
         stale.append("コード（" + (diff or "内容が変化") + "）")
     if g.get("checks_fp") != ctx.checks_fp:
         stale.append("チェックの定義")
+    if g.get("config_fp") and g.get("config_fp") != ctx.config_fp:
+        stale.append("設定")
     vres = (g.get("results") or {}).get("verifications", {})
     changed_v, new_v = [], []
     for _r, _p, v in iter_verifications(s):
@@ -512,6 +536,8 @@ def problems(ctx, stage="pr"):
         rs.append("検証条件")
     if rv.get("checks_fp") != ctx.checks_fp:
         rs.append("チェックの定義")
+    if rv.get("config_fp") and rv.get("config_fp") != ctx.config_fp:
+        rs.append("設定")
     if rv.get("spec_hash") != ctx.spec_hash:
         rs.append("仕様")
     if rv.get("design_hash") != ctx.design_hash:
@@ -633,6 +659,10 @@ def instruction(p, ctx):
         if c == "spec_unapproved":
             return (head + "\n→ 人間が承認したら spec --approve \"<人間の返答の要約>\"。修正の要望なら "
                     "answer ではなく aq-dlc:requirements に修正を依頼する（依頼内容は question で記録してもよい）。")
+        if c == "config_changed":
+            return (head + "\n→ 変更前後の設定（git diff .aq-dlc/config.json、~/.aq-dlc/config.json）を確認し、ask を実行してから"
+                    "人間に変更を受け入れるか確認する。受け入れるなら config-accept \"<人間の返答の要約>\"、受け入れないなら"
+                    "人間に元に戻してもらう。")
         if c == "manual_unconfirmed":
             return (head + "\n→ ask \"<確認してほしいこと（まとめて）>\" を実行してから人間に確認し、"
                     "確認できたものを confirm <検証ID> \"<人間の返答の要約>\" で記録する。")

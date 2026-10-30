@@ -6,7 +6,7 @@ import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from helpers import REVIEW_PASS, Env, build_to_review, edit_json, read_file, write_file  # noqa: E402
+from helpers import REVIEW_PASS, Env, build_to_review, denied, edit_json, read_file, write_file  # noqa: E402
 
 
 def finish_review(e):
@@ -67,14 +67,26 @@ class InvalidationTest(unittest.TestCase):
         self.assert_stale(["再レビュー", "検証条件"])
 
     def test_check_definition_change(self):
+        # エンジンのコマンド以外で設定を変えると、まず人間の確認が必要
         p = os.path.join(self.e.project, ".aq-dlc", "config.json")
         edit_json(p, lambda cfg: cfg["checks"][0].update(command="true"))
+        self.assert_stale(["設定", "エンジンのコマンド以外"])
+        self.assertTrue(denied(self.e.spawn("reviewer")))
+        self.e.aq("config-accept", "確認しました", ok=False)  # ask と人間の返答がない
+        self.e.aq("ask", "チェックのコマンドが変わりました。受け入れますか")
+        self.e.human_says("受け入れます")
+        self.e.aq("config-accept", "人間が変更を受け入れた")
+        # 受け入れた後も、古い gate とレビューは使えない
+        self.assert_stale(["チェックの定義"])
+
+    def test_check_definition_change_via_engine(self):
+        self.e.aq("add-check", "unit", "true", "--kind", "unit")
         self.assert_stale(["チェックの定義"])
 
     def test_gate_env_change(self):
         p = os.path.join(self.e.project, ".aq-dlc", "config.json")
         edit_json(p, lambda cfg: cfg.setdefault("gate", {}).update(env={"NODE_ENV": "test"}))
-        self.assert_stale(["チェックの定義"])
+        self.assert_stale(["設定", "エンジンのコマンド以外"])
 
     def test_spec_doc_change(self):
         p = os.path.join(self.e.arts, "spec.md")

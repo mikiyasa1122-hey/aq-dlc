@@ -36,7 +36,7 @@ $AQ trace     # 要求 → 受け入れ条件/リスク → 設計 → 実装 �
 ```
 
 統括が使うコマンド:
-`setup` `doctor` `init` `publish` `new` / `spec [--present | --approve "<人間の返答の要約>"]` `show <ID>` `answer <質問ID> "<回答>"` / `ask "<質問>"` `resume` / `escalation [<ID> --resolve "<対応>"]` / `gate [--after-merge]` `ci --wait 8` / `memory --tags .. --record` `memory-use` `memory-done --saved/--merged/--skipped` / `metrics` / `complete` `abort` / `confirm <検証ID> "<人間の確認内容>"`
+`setup` `doctor` `init` `publish` `new` / `spec [--present | --approve "<人間の返答の要約>"]` `show <ID>` `answer <質問ID> "<回答>"` / `ask "<質問>"` `resume` / `escalation [<ID> --resolve "<対応>"]` / `gate [--after-merge]` `ci --wait 8` / `memory --tags .. --record` `memory-use` `memory-done --saved/--merged/--skipped` / `metrics` / `complete` `abort` / `confirm <検証ID> "<人間の確認内容>"` / `config-accept "<人間の返答の要約>"`（設定がエンジン以外で変わったとき、人間に確認してから）
 
 要求・設計・実装の登録コマンド（req, accept, risk, verify, question, assume, drop, design-map, decision, add-check, bind, impl-map）は各担当のもので、**統括は使えない**（hook で止まる）。state.json と config.json は誰も直接編集しない。
 

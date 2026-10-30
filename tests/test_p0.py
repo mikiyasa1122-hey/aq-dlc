@@ -83,7 +83,7 @@ class P01ReviewVerdictTest(unittest.TestCase):
         self.assert_not_completable()
 
     def test_pass_with_blocking_is_contradiction(self):
-        res = self.e.spawn("reviewer")
+        self.assertFalse(denied(self.e.spawn("reviewer")))
         self.e.start("reviewer")
         res = self.e.stop("reviewer", review("判定: 合格", 1, 0, MAJOR))
         self.assertTrue(blocked(res))
@@ -126,10 +126,8 @@ class P02GateIntegrityTest(unittest.TestCase):
         self.e.cleanup()
 
     def add_check(self, name, code, kind="other"):
-        e = self.e
         py = f'"{sys.executable}"'
-        edit_json(os.path.join(e.project, ".aq-dlc", "config.json"),
-                  lambda c: c["checks"].append({"name": name, "command": f"{py} -c \"{code}\"", "kind": kind}))
+        self.e.aq("add-check", name, f"{py} -c \"{code}\"", "--kind", kind)
 
     def test_source_change_during_gate_fails(self):
         self.add_check("mutate", "open('src/memo.py','a').write('# x\\\\n')")
@@ -161,8 +159,7 @@ class P02GateIntegrityTest(unittest.TestCase):
     def test_rerun_after_fix_passes(self):
         self.add_check("mutate", "open('src/memo.py','a').write('# x\\\\n')")
         self.e.aq("gate")
-        edit_json(os.path.join(self.e.project, ".aq-dlc", "config.json"),
-                  lambda c: c.update(checks=[x for x in c["checks"] if x["name"] != "mutate"]))
+        self.e.aq("remove-check", "mutate")
         # gate が書き換えたコードは実装担当が取り込む（担当外の変更）→ gate → レビュー
         self.assertIn("実装", self.e.next())
         self.e.spawn("implementer")

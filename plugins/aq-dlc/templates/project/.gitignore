@@ -15,12 +15,12 @@ __pycache__/
 .venv/
 venv/
 node_modules/
-dist/
-build/
-target/
-coverage/
-.next/
-.turbo/
+/dist/
+/build/
+/target/
+/coverage/
+/.next/
+/.turbo/
 
 # OS / エディタ
 .DS_Store

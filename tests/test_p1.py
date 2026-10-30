@@ -5,7 +5,7 @@ import sys
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from helpers import REVIEW_PASS, Env, blocked, build_to_review, read_file, write_file  # noqa: E402
+from helpers import REVIEW_PASS, Env, blocked, build_to_review, denied, read_file, write_file  # noqa: E402
 
 MEM = """---
 id: {id}
@@ -67,9 +67,9 @@ class TestQualityTest(unittest.TestCase):
         write_file(os.path.join(e.project, "package.json"), '{"dependencies": {"react": "18.3.1"}}')
         p = os.path.join(e.arts, "impl.md")
         write_file(p, read_file(p) + "\n（package.json 追加）\n")
-        e.stop("implementer", "")
+        self.assertIsNone(e.stop("implementer", ""))
         e.aq("gate")
-        e.spawn("reviewer")
+        self.assertFalse(denied(e.spawn("reviewer")))
         brief = e.start("reviewer")["hookSpecificOutput"]["additionalContext"]
         self.assertIn("Web アプリに見えるが、E2E のチェック・検証がない", brief)
         res = e.stop("reviewer", REVIEW_PASS.replace("### E2E の要否\n- 不要（画面を持たないライブラリのため）\n", ""))

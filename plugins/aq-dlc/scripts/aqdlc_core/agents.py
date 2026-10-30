@@ -12,7 +12,7 @@ import time
 
 from . import gate as G
 from .project import config, engine_cmd
-from .state import (ROLES, ROLE_LABEL, Ctx, artifacts_dir, bump, doc_hash, doc_path, gate_status,
+from .state import (ROLES, ROLE_LABEL, Ctx, artifacts_dir, bump, doc_hash, doc_path, gate_status, open_violations,
                     current_review, graph_issues, id_index, iter_verifications, last_impl, latest_review, problems,
                     review_passed,
                     run_dir, running_agents, save_state)
@@ -25,8 +25,11 @@ PREFIX = "aq-dlc:"
 def role_of(agent_type):
     if not agent_type:
         return "orchestrator"
-    name = agent_type.split(":")[-1]
-    return name if name in ROLES and (agent_type.startswith(PREFIX) or ":" not in agent_type) else "other"
+    # プラグインのエージェント（aq-dlc:<担当>）だけを担当として扱う。接頭辞のない同名のエージェント
+    # （.claude/agents/implementer.md など）は担当外（other）とみなし、成りすましを防ぐ
+    if agent_type.startswith(PREFIX) and agent_type[len(PREFIX):] in ROLES:
+        return agent_type[len(PREFIX):]
+    return "other"
 
 
 # ------------------------------------------------------------------ markdown helpers
@@ -88,17 +91,21 @@ def pending_fix(ctx):
     rv = current_review(s)
     li = last_impl(s)
     items, kind = [], None
+    unowned = []
     if li and li.get("code_fp") and li["code_fp"] != ctx.code_fp:
         c, a, r = G.snapshot_diff(li.get("snapshot") or {}, ctx.snap)
-        kind = ("unowned", li["n"])
+        unowned = c + a + r or ["（git diff で確認）"]
+    for v in open_violations(s):
+        unowned += [f for f in v.get("files", []) if f not in unowned]
+    if unowned:
+        kind = ("unowned", li["n"] if li else 0)
         items = [{"label": f"担当外{i + 1}", "text": f"{f}（実装担当以外の操作で変更・追加・削除された。"
-                  "内容を確認し、正しければ取り込み、不要なら元に戻す）"} for i, f in enumerate((c + a + r)[:20])]
-        if not items:
-            items = [{"label": "担当外1", "text": "実装担当以外の操作でコードが変わった（git diff で確認する）"}]
-        return kind, items
+                  "内容を確認し、正しければ取り込み、不要なら元に戻す）"} for i, f in enumerate(unowned[:20])]
     if rv and not review_passed(rv) and (not li or li["seq"] < rv["seq"]):
-        kind = ("review", rv["n"])
-        items = [f for f in rv.get("findings", []) if f.get("severity") == "重大"] or rv.get("findings", [])
+        kind = kind or ("review", rv["n"])
+        items += [f for f in rv.get("findings", []) if f.get("severity") == "重大"] or rv.get("findings", [])
+    if kind:
+        return kind, items
     g = s.get("gate")
     if not kind and g and (not li or li["seq"] < g["seq"]):
         failed = [(n, r) for n, r in g["results"]["checks"].items() if not r["pass"]]
@@ -328,7 +335,7 @@ def _brief_reviewer(ctx):
         "## 最後の報告（この形式で書く。エンジンが読み取って記録する）",
         "```",
         "## レビュー結果",
-        "判定: 合格 または 要修正",
+        "判定: <合格 か 要修正 の1語だけ>",
         "重大な指摘: <数>",
         "軽微な指摘: <数>",
         f"レビュー対象: 仕様 {short(ctx.spec_hash)} / 設計 {short(ctx.design_hash)} / コード {short(ctx.code_fp)}",
@@ -365,6 +372,8 @@ def spawn_problem(role, ctx):
         return None
     probs = problems(ctx)
     codes = [p["code"] for p in probs]
+    if [p for p in probs if p["code"] == "config_changed"]:
+        return "設定がエンジンのコマンド以外で変更されています。人間の確認（ask → config-accept）が済むまで進めません。"
     spec_block = {"spec_missing", "graph_incomplete", "spec_unregistered", "questions_open",
                   "answers_unapplied", "spec_unpresented", "spec_unapproved", "dup_ids"}
     blocking = [p for p in probs if p["code"] in spec_block]
@@ -384,7 +393,8 @@ def spawn_problem(role, ctx):
         if design_block:
             return "設計が揃っていないため、レビューできません: " + design_block[0]["msg"]
         pre = [p for p in probs if p["code"] in ("impl_missing", "impl_stale", "impl_untraced", "verif_unbound",
-                                                 "code_unowned", "review_fix", "gate_missing", "gate_stale",
+                                                 "code_unowned", "violation_open", "review_fix", "gate_missing",
+                                                 "gate_stale",
                                                  "gate_fail", "gate_modified")]
         if pre:
             return "Quality Gate を通過した最新の実装がないため、レビューできません: " + pre[0]["msg"]
@@ -395,9 +405,15 @@ def spawn_problem(role, ctx):
 # ------------------------------------------------------------------ report parsing
 def parse_review(text):
     t = text or ""
-    m = re.search(r"判定\s*[:：]\s*\**\s*([^\s*｜|/]+)", t)
-    raw_verdict = m.group(1).strip() if m else None
+    # 判定行は行全体で照合する（「合格 ではなく要修正」「合格 / 要修正」のような行は不正）
+    lines = [ln for ln in t.splitlines() if re.match(r"^\s*[-*]?\s*\**\s*判定\s*\**\s*[:：]", ln)]
+    values = []
+    for ln in lines:
+        v = re.sub(r"^\s*[-*]?\s*\**\s*判定\s*\**\s*[:：]", "", ln).strip().strip("*`").strip()
+        values.append(v)
+    raw_verdict = values[0] if values else None
     verdict = raw_verdict if raw_verdict in ("合格", "要修正") else None
+    verdict_conflict = len(set(values)) > 1
     m = re.search(r"重大な指摘\s*[:：]\s*\**\s*(\d+)", t)
     head_block = int(m.group(1)) if m else None
     m = re.search(r"軽微な指摘\s*[:：]\s*\**\s*(\d+)", t)
@@ -405,7 +421,7 @@ def parse_review(text):
     findings = []
     cur = None
     for ln in t.splitlines():
-        mm = re.match(r"^\s*[-*]?\s*\[(重大|軽微)\s*(\d+)\]\s*(.*)", ln)
+        mm = re.match(r"^\s*(?:[-*・]|\d+[.)．])?\s*\**\s*[\[［【]\s*(重大|軽微)\s*(\d+)\s*[\]］】]\**\s*(.*)", ln)
         if mm:
             cur = {"severity": mm.group(1), "label": f"{mm.group(1)}{mm.group(2)}", "text": mm.group(3).strip()}
             c = re.search(r"区分\s*[:：]\s*(実装|テスト|仕様|設計)", ln)
@@ -418,12 +434,16 @@ def parse_review(text):
         elif ln.strip().startswith("#"):
             cur = None
     missing = bullet_items(section(t, "不足しているリスク"))
-    blocking_entries = sum(1 for f in findings if f["severity"] == "重大")
+    # 書き方の揺れに関係なく、本文に「重大n」のラベルがあれば重大な指摘として数える（安全側）
+    labels_anywhere = set(re.findall(r"[\[［【]\s*重大\s*(\d+)\s*[\]］】]", t))
+    blocking_entries = max(sum(1 for f in findings if f["severity"] == "重大"), len(labels_anywhere))
     errors = []
     if raw_verdict is None:
-        errors.append("「判定: 合格 または 要修正」の行がない")
+        errors.append("「判定: 合格」または「判定: 要修正」の行がない")
     elif verdict is None:
-        errors.append(f"判定「{raw_verdict}」は不正（「合格」か「要修正」のどちらか）")
+        errors.append(f"判定「{raw_verdict}」は不正（行には「合格」か「要修正」の1語だけを書く）")
+    if verdict_conflict:
+        errors.append("判定の行が複数あり、値が一致しない")
     if head_block is None:
         errors.append("「重大な指摘: <数>」の行がない")
     blocking = max(head_block or 0, blocking_entries)
@@ -488,6 +508,11 @@ def validate(role, ctx, entry, message):
                 errs.append(f"実装報告の「設計書: {short(ctx.design_hash)}」の行がない、または古い版を参照している")
             if not hash_line_ok(md, "仕様", ctx.spec_hash):
                 errs.append(f"実装報告の「仕様: {short(ctx.spec_hash)}」の行がない、または古い版を参照している")
+            vfiles = sorted({f for v in open_violations(s) for f in v.get("files", [])})
+            sec_all = section(md, "指摘への対応") or ""
+            missv = [f for f in vfiles if f not in sec_all]
+            if missv:
+                errs.append("「## 指摘への対応」に、担当外の変更の記録があるファイルへの対応がない: " + "、".join(missv[:8]))
             fix = entry.get("fix") or {}
             if fix.get("labels"):
                 sec = section(md, "指摘への対応") or ""
@@ -549,8 +574,10 @@ def register(role, ctx, entry, message):
         rounds = s["impl"]["rounds"]
         n = len(rounds) + 1
         fix = entry.get("fix") or {}
+        for v in open_violations(s):
+            v["resolved"] = {"by_round": n, "seq": seq}
         rec = {"n": n, "seq": seq, "at": now_iso(), "code_fp": ctx.code_fp, "snapshot": ctx.snap,
-               "design_hash": ctx.design_hash,
+               "config_fp": ctx.config_fp, "design_hash": ctx.design_hash,
                "spec_hash": ctx.spec_hash, "report_hash": doc_hash(rd, "impl"), "fix": fix or None}
         rounds.append(rec)
         if fix:
@@ -578,6 +605,7 @@ def register(role, ctx, entry, message):
             invalid = "判定を読み取れない"
         rec["passed"] = bool(rec.get("passed")) and invalid is None
         rec.update({"n": n, "seq": seq, "at": now_iso(), "code_fp": code_now, "graph_fp": ctx.graph_fp,
+                    "config_fp": ctx.config_fp,
                     "checks_fp": ctx.checks_fp, "spec_hash": ctx.spec_hash, "design_hash": ctx.design_hash,
                     "gate_stamp": (s.get("gate") or {}).get("stamp"), "report": os.path.relpath(path, ctx.project),
                     "valid": invalid is None, "invalid_reason": invalid})
@@ -607,7 +635,7 @@ def on_pre_agent(payload, project, state, spath):
     cfg = config(project)
     if not state:
         return deny("実行中の run がありません。AQ-DLC の開発は new で run を開始してから行います。")
-    ctx = Ctx(project, state, cfg)
+    ctx = Ctx(project, state, cfg, fresh=(role == "reviewer"))
     why = spawn_problem(role, ctx)
     if why:
         return deny(why)
@@ -624,7 +652,7 @@ def on_subagent_start(payload, project, state, spath):
     role = role_of(payload.get("agent_type"))
     if role not in ROLES or not state:
         return None
-    ctx = Ctx(project, state)
+    ctx = Ctx(project, state, fresh=True)
     aid = payload.get("agent_id") or f"{role}-{time.time()}"
     fresh, passing = gate_status(ctx)
     gate_ok = fresh and passing
@@ -657,7 +685,7 @@ def on_subagent_stop(payload, project, state, spath):
         aid = cand[-1] if cand else aid
         entry = running.get(aid, {"role": role, "since": now_iso(), "blocks": 0})
     message = payload.get("last_assistant_message") or _last_message(payload.get("agent_transcript_path"))
-    ctx = Ctx(project, state)
+    ctx = Ctx(project, state, fresh=True)
     errs = validate(role, ctx, entry, message)
     max_blocks = int(config(project)["automation"].get("max_agent_stop_blocks", 3))
     if errs and entry.get("blocks", 0) < max_blocks and not (role == "reviewer" and _tainted(entry, ctx)):
@@ -868,9 +896,17 @@ def real_target(path):
 
 
 # ------------------------------------------------------------------ Bash の前後でのファイル変更の検出
-def bash_snapshot_path(rd, tool_use_id):
+def bash_snapshot_dir(project):
+    """Bash の実行前の記録の置き場所。プロジェクトの外（~/.aq-dlc/tmp）に置き、Bash からの削除・改ざんを難しくする。"""
+    import hashlib
+    from .project import home
+    key = hashlib.sha1(os.path.realpath(project).encode("utf-8")).hexdigest()[:16]
+    return os.path.join(home(), "tmp", key)
+
+
+def bash_snapshot_path(project, tool_use_id):
     safe = re.sub(r"[^A-Za-z0-9_-]", "_", tool_use_id or "last")[:80]
-    return os.path.join(rd, "tmp", f"bash-{safe}.json")
+    return os.path.join(bash_snapshot_dir(project), f"bash-{safe}.json")
 
 
 GIT_SYNC = re.compile(r"\bgit\s+(?:-C\s+\S+\s+)?(switch|checkout|pull|merge|rebase|reset|stash|restore|cherry-pick|revert|am)\b")
@@ -896,6 +932,13 @@ def check_write(role, path, project, state, cfg):
     # シンボリックリンクをたどった実体で判定する（リンク経由でプロジェクト内を書き換えるのを防ぐ）
     path = real_target(path)
     project = os.path.realpath(project)
+    from .project import home
+    h = os.path.realpath(home())
+    if is_within(path, h):
+        # 全体設定・実行中の記録は、エージェントからは変更できない（Memory は統括だけが書ける）
+        if is_within(path, os.path.join(h, "memory")):
+            return None if role == "orchestrator" else "サブエージェントは共通の Memory を変更できません。"
+        return "AQ-DLC の全体設定・記録（~/.aq-dlc）はエージェントからは変更できません（人が直接編集する）。"
     if not is_within(path, project):
         return None
     rel = os.path.relpath(norm(path), norm(project)).replace(os.sep, "/")
@@ -918,6 +961,8 @@ def check_write(role, path, project, state, cfg):
     if not state or state.get("status") not in ("in_progress", "pr_ready") or not auto.get("enforce_roles", True):
         return None
     if rel.startswith(".claude/"):
+        if re.match(r"\.claude/(agents|skills|hooks|commands)/|\.claude/settings[^/]*\.json$", rel):
+            return "run の実行中は .claude のエージェント定義・Skill・hook・設定を変更できません（担当の成りすましを防ぐ）。"
         return None if role == "orchestrator" else "サブエージェントは .claude 配下を変更できません。"
     if role == "implementer":
         return None

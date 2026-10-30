@@ -20,34 +20,64 @@ LEVELS = {"unit", "integration", "e2e", "manual", "other"}
 
 
 # ------------------------------------------------------------------ code fingerprint
+# 依存関係・キャッシュ（どの階層にあってもソースではない）
+DEP_DIRS = {".git", ".aq-dlc", ".claude", "node_modules", ".venv", "venv", "__pycache__", ".pytest_cache",
+            ".mypy_cache", ".ruff_cache", ".gradle", ".tox", ".nox"}
+
+
 def source_files(project, cfg):
-    ignore = set(cfg["gate"]["ignore_dirs"]) | {".aq-dlc", ".claude", ".git"}
-    files = None
+    """指紋の対象のファイル。
+
+    - git で追跡しているファイルは、常に対象（ignore_dirs や .gitignore の設定で外れない）
+    - 追跡していないファイルは、.gitignore 済みを除く
+    - ignore_dirs（ビルド出力など）は、プロジェクト直下のフォルダ名にだけ適用する（src/build/ のような
+      ソースのフォルダを誤って外さない）。依存関係・キャッシュのフォルダはどの階層でも外す
+    """
+    top_ignore = set(cfg["gate"]["ignore_dirs"])
+    tracked, others = None, None
     if shutil.which("git") and os.path.isdir(project):
         code, out = sh_run("git rev-parse --is-inside-work-tree", project, 30)
         if code == 0 and out.strip() == "true":
-            code, out = sh_run("git ls-files -co --exclude-standard -z", project, 120)
-            if code == 0:
-                files = [f for f in out.split("\0") if f.strip()]
-    if files is None:
-        files = []
+            c1, o1 = sh_run("git ls-files -c -z", project, 120)
+            c2, o2 = sh_run("git ls-files -o --exclude-standard -z", project, 120)
+            if c1 == 0 and c2 == 0:
+                tracked = [f for f in o1.split("\0") if f.strip()]
+                others = [f for f in o2.split("\0") if f.strip()]
+    if tracked is None:
+        tracked, others = [], []
         for dirpath, dirnames, filenames in os.walk(project):
-            dirnames[:] = [d for d in dirnames if d not in ignore]
+            rel_dir = os.path.relpath(dirpath, project)
+            dirnames[:] = [d for d in dirnames if d not in DEP_DIRS and not (rel_dir == "." and d in top_ignore)]
             for name in filenames:
-                files.append(os.path.relpath(os.path.join(dirpath, name), project))
+                others.append(os.path.relpath(os.path.join(dirpath, name), project))
     out = set()
-    for f in files:
+    for f in tracked:
         rel = f.replace(os.sep, "/").strip()
         parts = rel.split("/")
-        if any(p in ignore for p in parts[:-1]):
+        if parts[0] in (".aq-dlc", ".claude", ".git"):
+            continue
+        out.add(rel)
+    for f in others:
+        rel = f.replace(os.sep, "/").strip()
+        parts = rel.split("/")
+        if any(p in DEP_DIRS for p in parts[:-1]) or (len(parts) > 1 and parts[0] in top_ignore):
             continue
         out.add(rel)
     return sorted(out)
 
 
-def snapshot(project, cfg, previous=None):
-    """{相対パス: [サイズ, 更新時刻, sha1]}。サイズと更新時刻が同じなら前回のハッシュを再利用する。"""
-    previous = previous or {}
+def _stat_key(st):
+    # 更新時刻だけでなく ctime（utime で戻せない）と inode も比べる
+    return [st.st_size, st.st_mtime_ns, getattr(st, "st_ctime_ns", 0), getattr(st, "st_ino", 0)]
+
+
+def snapshot(project, cfg, previous=None, fresh=False):
+    """{相対パス: [サイズ, 更新時刻, sha1, ctime, inode]}。
+
+    fresh=True ならキャッシュを使わず全ファイルをハッシュし直す（gate の開始・終了、各工程の登録、完了判定）。
+    fresh=False なら、サイズ・更新時刻・ctime・inode がすべて前回と同じファイルだけハッシュを再利用する。
+    """
+    previous = {} if fresh else (previous or {})
     snap = {}
     for rel in source_files(project, cfg):
         p = os.path.join(project, rel)
@@ -57,12 +87,13 @@ def snapshot(project, cfg, previous=None):
             continue
         if not os.path.isfile(p):
             continue
+        key = _stat_key(st)
         old = previous.get(rel)
-        if old and old[0] == st.st_size and abs(old[1] - st.st_mtime) < 1e-6:
+        if old and len(old) == 5 and [old[0], old[1], old[3], old[4]] == key:
             snap[rel] = old
             continue
         try:
-            snap[rel] = [st.st_size, st.st_mtime, sha1_file(p)]
+            snap[rel] = [key[0], key[1], sha1_file(p), key[2], key[3]]
         except OSError:
             continue
     return snap
@@ -101,6 +132,11 @@ def check_fp(c, cfg):
 
 def checks_fp(cfg):
     return fingerprint(sorted(check_fp(c, cfg) for c in cfg.get("checks", [])))
+
+
+def config_fp(cfg):
+    """実際に使われる設定全体（全体設定＋プロジェクト設定）の指紋。指紋の対象・自動化の境界の改ざんを検出する。"""
+    return fingerprint({k: v for k, v in cfg.items() if not k.startswith("_")})
 
 
 def verification_fp(v, cfg):

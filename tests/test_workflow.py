@@ -37,7 +37,7 @@ class WorkflowTest(unittest.TestCase):
         self.assertFalse(denied(res), res)
         self.assertIs(res["hookSpecificOutput"]["updatedInput"]["run_in_background"], False)
         ctx = e.start("reviewer")["hookSpecificOutput"]["additionalContext"]
-        self.assertIn("判定: 合格 または 要修正", ctx)
+        self.assertIn("判定: <合格 か 要修正 の1語だけ>", ctx)
         self.assertIsNone(e.stop("reviewer", REVIEW_FAIL))
         s = e.state()
         self.assertEqual(s["reviews"][-1]["blocking"], 1)

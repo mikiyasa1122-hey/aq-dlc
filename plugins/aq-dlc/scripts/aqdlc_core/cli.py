@@ -279,9 +279,12 @@ def cmd_add_check(args):
     if timeout:
         entry["timeout_sec"] = int(timeout)
     cfg["checks"] = [c for c in cfg.get("checks", []) if c.get("name") != name] + [entry]
-    save_json(path, cfg)
     state, spath = load_state(project)
+    if state and state.get("config_fp_registered") and state["config_fp_registered"] != G.config_fp(config(project)):
+        die("設定がエンジンのコマンド以外で変更されています。先に人間の確認（config-accept）を済ませてください。")
+    save_json(path, cfg)
     if state:
+        state["config_fp_registered"] = G.config_fp(config(project))
         log(state, project, "check.update" if old else "check.add", {"name": name, "before": old, "after": entry})
         save_state(spath, state)
     info(f"チェックを登録しました: {name}（{kind}）→ {command}")
@@ -295,9 +298,12 @@ def cmd_remove_check(args):
     cfg = load_json(path, {}) or {}
     old = next((c for c in cfg.get("checks", []) if c.get("name") == args[0]), None)
     cfg["checks"] = [c for c in cfg.get("checks", []) if c.get("name") != args[0]]
-    save_json(path, cfg)
     state, spath = load_state(project)
+    if state and state.get("config_fp_registered") and state["config_fp_registered"] != G.config_fp(config(project)):
+        die("設定がエンジンのコマンド以外で変更されています。先に人間の確認（config-accept）を済ませてください。")
+    save_json(path, cfg)
     if state and old:
+        state["config_fp_registered"] = G.config_fp(config(project))
         log(state, project, "check.remove", {"name": args[0], "before": old})
         save_state(spath, state)
     info(f"{'削除しました' if old else '見つかりませんでした'}: {args[0]}")
@@ -442,6 +448,21 @@ def cmd_confirm(args):
     mutate(args, fn)
 
 
+def cmd_config_accept(args):
+    """config-accept "<人間の返答の要約>" — エンジン以外で変わった設定を、人間が確認したうえで受け入れる"""
+    def fn(project, s, a):
+        note = " ".join(a).strip()
+        if not note:
+            die('使い方: config-accept "<人間の返答の要約>"（ask で変更内容を人間に確認した後に実行する）')
+        if not s.get("asked_seq") or last_human_seq(s) <= s["asked_seq"]:
+            die("ask の後に人間の返答が記録されていません。設定の変更内容を ask で人間に確認してから実行してください。")
+        new = G.config_fp(config(project))
+        log(s, project, "config.accept", {"before": s.get("config_fp_registered"), "after": new, "note": note})
+        s["config_fp_registered"] = new
+        info("設定の変更を、人間の確認済みとして受け入れました（gate と独立レビューはやり直しになります）。")
+    mutate(args, fn)
+
+
 def cmd_escalation(args):
     resolve = pop_opt(args, "--resolve")
     project, s, spath = open_state(args)
@@ -487,15 +508,16 @@ def cmd_gate(args):
         stamp = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
         info(f"gate {stamp}  ({project})")
         # 実行開始時のコード・チェック定義・検証条件（gate の結果はこれに紐付ける）
-        before = G.snapshot(project, cfg, (s.get("gate") or {}).get("snapshot"))
+        before = G.snapshot(project, cfg, fresh=True)
         checks_fp_before = G.checks_fp(cfg)
+        config_fp_before = G.config_fp(cfg)
         vfp_before = {v["id"]: G.verification_fp(v, cfg) for _r, _p, v in iter_verifications(s)}
         t0 = time.time()
         results, ok = G.run_gate(project, s, cfg, iter_verifications, os.path.join(ctx.rd, "gate"), stamp,
                                  after_merge)
         dur = round(time.time() - t0, 1)
         cfg_after = config(project)
-        after = G.snapshot(project, cfg_after, before)
+        after = G.snapshot(project, cfg, fresh=True)
     finally:
         try:
             os.remove(lock)
@@ -506,6 +528,8 @@ def cmd_gate(args):
     changed_defs = []
     if G.checks_fp(cfg_after) != checks_fp_before:
         changed_defs.append("チェックの定義")
+    if G.config_fp(cfg_after) != config_fp_before:
+        changed_defs.append("設定")
     vfp_after = {v["id"]: G.verification_fp(v, cfg_after) for _r, _p, v in iter_verifications(s)}
     if vfp_after != vfp_before:
         changed_defs.append("検証条件")
@@ -516,7 +540,7 @@ def cmd_gate(args):
         ok = False  # 検証したものと結果を紐付けるものが一致しないため不合格
     s["gate"] = {"seq": bump(s), "stamp": stamp, "ran_at": now_iso(), "after_merge": after_merge, "sec": dur,
                  "code_fp": G.code_fp(before), "code_fp_after": G.code_fp(after), "snapshot": before,
-                 "checks_fp": checks_fp_before, "graph_fp": ctx.graph_fp, "checks_pass": ok, "results": results,
+                 "checks_fp": checks_fp_before, "config_fp": config_fp_before, "graph_fp": ctx.graph_fp, "checks_pass": ok, "results": results,
                  "modified_during_gate": modified}
     s.setdefault("gate_history", []).append({"stamp": stamp, "pass": ok, "sec": dur, "after_merge": after_merge,
                                              "modified": bool(modified)})
@@ -557,7 +581,7 @@ def cmd_complete(args):
     project, s, spath = open_state(args)
     if running_agents(s):
         die("サブエージェントの実行中は完了にできません。")
-    ctx = Ctx(project, s)
+    ctx = Ctx(project, s, fresh=True)
     probs = problems(ctx, "pr")
     if probs:
         print("[aq-dlc] まだ PR を出せる状態ではありません:\n  - " + "\n  - ".join(p["msg"] for p in probs))
@@ -615,7 +639,7 @@ def cmd_status(args):
 def cmd_check(args):
     project, s, _ = open_state(args)
     stage = "final" if s.get("status") == "pr_ready" else "pr"
-    probs = problems(Ctx(project, s), stage)
+    probs = problems(Ctx(project, s, fresh=True), stage)
     if probs:
         print("[aq-dlc] 完了条件を満たしていません:\n  - " + "\n  - ".join(p["msg"] for p in probs))
         sys.exit(1)
@@ -797,23 +821,24 @@ def hook_pre_bash(payload):
     why = A.check_bash(role, cmd, project, state, cfg)
     if why:
         return A.deny(why)
-    # 実装担当以外の Bash は、実行前のコードの状態を記録しておき、実行後に変更がないか確かめる
-    if state and state.get("status") in ("in_progress", "pr_ready") and role != "implementer" \
-            and cfg["automation"].get("enforce_roles", True):
-        rd = run_dir(project, state.get("run_id"))
-        if rd:
-            tmpd = os.path.join(rd, "tmp")
-            if os.path.isdir(tmpd):  # 対応する PostToolUse が来なかった古い記録を掃除する
-                for f in os.listdir(tmpd):
-                    fp = os.path.join(tmpd, f)
-                    try:
-                        if time.time() - os.path.getmtime(fp) > 3600:
-                            os.remove(fp)
-                    except OSError:
-                        pass
-            prev = (state.get("gate") or {}).get("snapshot")
-            save_json(A.bash_snapshot_path(rd, payload.get("tool_use_id")),
-                      {"role": role, "cmd": cmd[:2000], "snapshot": G.snapshot(project, cfg, prev)})
+    # 実装担当以外の Bash は、実行前のコードと設定の状態をプロジェクトの外に記録し、実行後に比べる。
+    # run がない間も「記録した」こと自体は残す（実行後に記録が消えていたら改ざんとして扱うため）。
+    if role != "implementer":
+        sdir = A.bash_snapshot_dir(project)
+        if os.path.isdir(sdir):  # 対応する PostToolUse が来なかった古い記録を掃除する
+            for f in os.listdir(sdir):
+                fp = os.path.join(sdir, f)
+                try:
+                    if time.time() - os.path.getmtime(fp) > 3600:
+                        os.remove(fp)
+                except OSError:
+                    pass
+        active = bool(state and state.get("status") in ("in_progress", "pr_ready"))
+        prev = (state.get("gate") or {}).get("snapshot") if state else None
+        save_json(A.bash_snapshot_path(project, payload.get("tool_use_id")),
+                  {"role": role, "cmd": cmd[:2000], "active": active,
+                   "snapshot": G.snapshot(project, cfg, prev) if active else None,
+                   "ignore_dirs": list(cfg["gate"]["ignore_dirs"]), "config_fp": G.config_fp(cfg)})
     if re.search(r"\b(git|gh)\b|api\.github\.com", cmd):
         try:
             reasons = gitops.guard_reasons(cmd, project, gitops.current_branch, gitops.remote_has_branch)
@@ -827,34 +852,68 @@ def hook_pre_bash(payload):
 
 
 def hook_post_bash(payload):
-    """実装担当以外の Bash がコードやテストを変えていないか（リダイレクト・スクリプト・変数展開などの手段を問わず検出）。"""
+    """実装担当以外の Bash がコード・テスト・設定を変えていないか。
+
+    リダイレクト・スクリプト・変数展開などの書き方に関係なく、実行前後のファイル内容で判定する。
+    """
+    role = A.role_of(payload.get("agent_type"))
+    if role == "implementer":
+        return None
     cwd, project, state, spath = hook_context(payload)
-    if not project or not state:
+    if not project:
         return None
-    rd = run_dir(project, state.get("run_id"))
-    if not rd:
-        return None
-    snap_path = A.bash_snapshot_path(rd, payload.get("tool_use_id"))
+    snap_path = A.bash_snapshot_path(project, payload.get("tool_use_id"))
     pre = load_json(snap_path, None)
-    if not pre:
-        return None
     try:
         os.remove(snap_path)
     except OSError:
         pass
+    active = bool(state and state.get("status") in ("in_progress", "pr_ready"))
     cfg = config(project)
-    after = G.snapshot(project, cfg, pre["snapshot"])
-    v = A.detect_bash_changes(pre["role"], pre["cmd"], pre["snapshot"], after, project)
-    if not v:
-        return None
+    if pre is None:
+        if not active:
+            return None
+        v = {"role": role, "at": now_iso(), "cmd": str((payload.get("tool_input") or {}).get("command", ""))[:500],
+             "files": [], "count": 0, "kind": "tamper",
+             "note": "実行前の記録が見つからない（記録の削除・改ざんの可能性）"}
+    else:
+        notes = []
+        if pre.get("config_fp") and pre["config_fp"] != G.config_fp(cfg):
+            notes.append("設定（config.json）が変更された")
+        files = []
+        if pre.get("snapshot") is not None:
+            # 実行前と同じ対象で比べる（設定で対象を外す改ざんをしても、ファイルの変更は見える）
+            same = dict(cfg, gate=dict(cfg["gate"], ignore_dirs=pre.get("ignore_dirs", cfg["gate"]["ignore_dirs"])))
+            after = G.snapshot(project, same, pre["snapshot"], fresh=True)
+            c, a, r = G.snapshot_diff(pre["snapshot"], after)
+            files = c + a + r
+        if not files and not notes:
+            return None
+        if not active and not notes:
+            return None
+        v = A.detect_bash_changes(role, pre.get("cmd", ""), {}, {}, project) or \
+            {"role": role, "at": now_iso(), "cmd": pre.get("cmd", "")[:500], "kind": "write"}
+        v.update(files=files[:50], count=len(files))
+        if A.GIT_SYNC.search(pre.get("cmd", "")):
+            v["kind"] = "git"
+        if notes and not files:
+            v["kind"] = "config"
+        if notes:
+            v["note"] = "、".join(notes)
     state, spath = load_state(project)
+    if not state:
+        return None
     v["seq"] = bump(state)
+    if v["kind"] == "config":
+        v["resolved"] = {"by": "config_changed で人間が確認する"}  # 設定の変更は config_changed（人間の確認）で扱う
     state.setdefault("violations", []).append(v)
     save_state(spath, state)
-    who = ROLE_LABEL.get(pre["role"], "統括")
-    reason = (f"AQ-DLC: 担当外の変更を検出しました（{who} の Bash で {v['count']} 件: {', '.join(v['files'][:5])}）。"
-              "run の実行中にコードやテストを変えられるのは実装担当だけです。この変更は記録され、"
-              "実装担当が内容を確認・取り込み、gate と独立レビューをやり直すまで、レビュー・完了に進めません。")
+    who = ROLE_LABEL.get(role, "統括")
+    detail = f"{v['count']} 件: {', '.join(v['files'][:5])}" if v.get("files") else v.get("note", "")
+    reason = (f"AQ-DLC: 担当外の変更を検出しました（{who} の Bash: {detail}）。"
+              "run の実行中にコードやテストを変えられるのは実装担当だけで、設定はエンジンのコマンドでだけ変えます。"
+              "この変更は記録され、実装担当の確認・取り込み（設定なら人間の確認）と gate・独立レビューのやり直しが"
+              "済むまで、レビュー・完了に進めません。")
     if v["kind"] == "git":
         reason += "（git の操作による作業ツリーの変化も、取り込みの確認が必要です）"
     return {"decision": "block", "reason": reason,
@@ -924,7 +983,12 @@ def hook_stop(payload):
     if w and time.time() < w.get("until", 0):
         return None
     cfg = config(project)
-    ctx = Ctx(project, state, cfg)
+    ctx = Ctx(project, state, cfg, fresh=state.get("status") == "complete")
+    total_cap = int(cfg["automation"].get("max_total_continues", 200))
+    if int(state.get("stop_blocks_total", 0)) >= total_cap and state.get("status") != "complete":
+        print(f"[aq-dlc] run 全体での自動継続の上限（{total_cap}回）に達したため停止を許可しました。"
+              "状況を確認して人間が判断してください。", file=sys.stderr)
+        return None
     if state.get("status") == "complete":
         final = problems(ctx, "final")
         if not final:
@@ -998,6 +1062,23 @@ LEGACY_HOOKS = {"stop-hook": "stop", "guard-hook": "pre-bash", "session-hook": "
 FAIL_CLOSED = {"pre-bash"}
 
 
+def _record_hook_error(payload, err):
+    """検出の処理で例外が起きたら、見逃さないように「確認が必要な変更」として記録する（安全側）。"""
+    try:
+        cwd = payload.get("cwd") or os.getcwd()
+        project = active_project_for(cwd)
+        state, spath = load_state(project) if project else (None, None)
+        if state and state.get("status") in ("in_progress", "pr_ready"):
+            state.setdefault("violations", []).append({
+                "role": A.role_of(payload.get("agent_type")), "at": now_iso(), "seq": bump(state), "kind": "error",
+                "cmd": str((payload.get("tool_input") or {}).get("command", ""))[:500], "files": [], "count": 0,
+                "note": f"変更の検出処理でエラー: {err}"})
+            save_state(spath, state)
+    except Exception:  # noqa: BLE001
+        pass
+    print(f"[aq-dlc] 変更の検出でエラーが発生したため、確認が必要な変更として記録しました: {err}", file=sys.stderr)
+
+
 def run_hook(name):
     payload = read_payload()
     fn = HOOKS.get(name)
@@ -1013,6 +1094,9 @@ def run_hook(name):
     except SystemExit:
         raise
     except Exception as e:  # noqa: BLE001
+        if name == "post-bash":
+            _record_hook_error(payload, e)
+            return
         if name in FAIL_CLOSED and gitops.dangerous_words((payload.get("tool_input") or {}).get("command", "") or ""):
             emit(A.deny(f"ガードの判定中にエラーが発生したため、安全のため止めました（{e}）"))
             return
@@ -1032,7 +1116,7 @@ COMMANDS = {
     "confirm": cmd_confirm, "escalation": cmd_escalation, "gate": cmd_gate, "ci": cmd_ci,
     "memory": memory.cmd_memory, "memory-done": memory.cmd_memory_done, "memory-use": memory.cmd_memory_use, "complete": cmd_complete, "abort": cmd_abort,
     "next": cmd_next, "status": cmd_status, "check": cmd_check, "trace": cmd_trace, "history": cmd_history,
-    "show": cmd_show, "metrics": cmd_metrics,
+    "show": cmd_show, "metrics": cmd_metrics, "config-accept": cmd_config_accept,
 }
 REMOVED = {"review": "レビュー結果は aq-dlc:reviewer の終了時にエンジンが自動で記録します（手動では記録できません）。",
            "phase": "フェーズは状態から自動で決まります（next で確認）。",
