@@ -36,7 +36,7 @@ $AQ trace     # 要求 → 受け入れ条件/リスク → 設計 → 実装 �
 ```
 
 統括が使うコマンド:
-`setup` `doctor` `init` `publish` `new` / `spec [--present | --approve "<人間の返答の要約>"]` `show <ID>` `answer <質問ID> "<回答>"` / `ask "<質問>"` `resume` / `escalation [<ID> --resolve "<対応>"]` / `gate [--after-merge]` `ci --wait 8` / `memory` `memory-done` / `complete` `abort` / `confirm <検証ID> "<人間の確認内容>"`
+`setup` `doctor` `init` `publish` `new` / `spec [--present | --approve "<人間の返答の要約>"]` `show <ID>` `answer <質問ID> "<回答>"` / `ask "<質問>"` `resume` / `escalation [<ID> --resolve "<対応>"]` / `gate [--after-merge]` `ci --wait 8` / `memory --tags .. --record` `memory-use` `memory-done --saved/--merged/--skipped` / `metrics` / `complete` `abort` / `confirm <検証ID> "<人間の確認内容>"` / `config-accept "<人間の返答の要約>"`（設定がエンジン以外で変わったとき、人間に確認してから）
 
 要求・設計・実装の登録コマンド（req, accept, risk, verify, question, assume, drop, design-map, decision, add-check, bind, impl-map）は各担当のもので、**統括は使えない**（hook で止まる）。state.json と config.json は誰も直接編集しない。
 
@@ -75,13 +75,13 @@ $AQ trace     # 要求 → 受け入れ条件/リスク → 設計 → 実装 �
 4. 修正ループが上限（`automation.max_fix_iterations`）に達したら、状況を要約して人間に方針を確認する。
 
 ### 5. Memory 整理
-**aq-dlc:memory Skill** の手順で学びを整理し、`$AQ memory-done`。
+**aq-dlc:memory Skill** の手順で学びを整理し、`$AQ memory-done --saved <ID> --merged <ID> --skipped "<理由>"`。run の最初（要求分析の前）に `$AQ memory --tags <タグ> --record` で関連する Memory を読み、使った結果を `$AQ memory-use` で記録しておく。
 
 ### 6. CI と PR
 1. コミットして作業ブランチを push し、`$AQ ci --wait 8`（Bash のタイムアウトは10分）。CI が失敗していたら実装担当に修正を依頼する。
 2. `$AQ complete`。満たしていない条件が出たら、`next` に従う。
 3. `gh pr create` で PR を作る。本文には `$AQ trace` の表（要求 → 証拠）、残った注意点、保存した Memory を書く。**マージは人間が行う。**
-4. ユーザーへの報告は短く: 作ったもの、確かめた方法、PR の URL、残った注意点、確認待ちの Memory。
+4. ユーザーへの報告は短く: 作ったもの、確かめた方法、PR の URL、残った注意点、確認待ちの Memory。`$AQ metrics` の要点（所要時間・gate の不合格・修正ループ・人の介入）も1〜2行で添える。
 
 ### 7. マージ後にしか確かめられないもの
 デプロイ後の公開 URL などは、要求分析で `--after-merge` 付きの検証になっている。
@@ -99,7 +99,7 @@ $AQ trace     # 要求 → 受け入れ条件/リスク → 設計 → 実装 �
 エンジンの入出力は UTF-8 に統一してある。Playwright を使う場合は、ブラウザをプロジェクト内に入れる（`PLAYWRIGHT_BROWSERS_PATH=0 npx playwright install`）。init 時に gate の環境変数にも同じ設定が入る。
 
 ## してはいけないこと
-- 自分でコードやテストを書く・直す（実装担当に依頼する）。
+- 自分でコードやテストを書く・直す（実装担当に依頼する）。Bash（リダイレクト・スクリプト・git の操作を含む）でコードが変わった場合も、エンジンが検出して記録し、実装担当の取り込み・gate・独立レビューをやり直すまで先に進めない。
 - 要求・設計・実装の登録コマンドを自分で使う、state.json / config.json を直接編集する。
 - 人間の返答なしに `spec --approve`・`answer`・`confirm` を実行する。
 - サブエージェントの説明だけで完了と報告する。

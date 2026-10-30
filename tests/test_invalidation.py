@@ -6,14 +6,14 @@ import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from helpers import REVIEW_PASS, Env, build_to_review, edit_json  # noqa: E402
+from helpers import REVIEW_PASS, Env, build_to_review, denied, edit_json, read_file, write_file  # noqa: E402
 
 
 def finish_review(e):
     e.spawn("reviewer")
     e.start("reviewer")
     assert e.stop("reviewer", REVIEW_PASS) is None
-    e.aq("memory-done")
+    e.aq("memory-done", "--skipped", "テスト用の run のため保存する学びなし")
 
 
 class InvalidationTest(unittest.TestCase):
@@ -34,9 +34,18 @@ class InvalidationTest(unittest.TestCase):
     def test_code_change(self):
         with open(os.path.join(self.e.project, "src", "memo.py"), "a", encoding="utf-8") as f:
             f.write("# x\n")
-        self.assert_stale(["gate 後に変わったものがある", "コード", "src/memo.py"])
-        # gate をやり直しても、レビューは古いまま
-        self.e.aq("gate")
+        # 実装担当以外の変更は、まず実装担当の取り込みが必要
+        self.assert_stale(["実装担当以外の操作でコードが変わった", "src/memo.py"])
+        e = self.e
+        e.spawn("implementer")
+        brief = e.start("implementer")["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("src/memo.py", brief)
+        p = os.path.join(e.arts, "impl.md")
+        write_file(p, read_file(p) + "\n## 指摘への対応\n- [担当外1] 追加された行を確認して取り込んだ\n")
+        self.assertIsNone(e.stop("implementer", "取り込み"))
+        # 取り込み後: gate は古い → gate をやり直しても、レビューは古いまま
+        self.assert_stale(["gate 後に変わったものがある", "コード"])
+        e.aq("gate")
         self.assert_stale(["再レビュー", "コード"])
 
     def test_mtime_only_change_is_not_stale(self):
@@ -58,14 +67,26 @@ class InvalidationTest(unittest.TestCase):
         self.assert_stale(["再レビュー", "検証条件"])
 
     def test_check_definition_change(self):
+        # エンジンのコマンド以外で設定を変えると、まず人間の確認が必要
         p = os.path.join(self.e.project, ".aq-dlc", "config.json")
         edit_json(p, lambda cfg: cfg["checks"][0].update(command="true"))
+        self.assert_stale(["設定", "エンジンのコマンド以外"])
+        self.assertTrue(denied(self.e.spawn("reviewer")))
+        self.e.aq("config-accept", "確認しました", ok=False)  # ask と人間の返答がない
+        self.e.aq("ask", "チェックのコマンドが変わりました。受け入れますか")
+        self.e.human_says("受け入れます")
+        self.e.aq("config-accept", "人間が変更を受け入れた")
+        # 受け入れた後も、古い gate とレビューは使えない
+        self.assert_stale(["チェックの定義"])
+
+    def test_check_definition_change_via_engine(self):
+        self.e.aq("add-check", "unit", "true", "--kind", "unit")
         self.assert_stale(["チェックの定義"])
 
     def test_gate_env_change(self):
         p = os.path.join(self.e.project, ".aq-dlc", "config.json")
         edit_json(p, lambda cfg: cfg.setdefault("gate", {}).update(env={"NODE_ENV": "test"}))
-        self.assert_stale(["チェックの定義"])
+        self.assert_stale(["設定", "エンジンのコマンド以外"])
 
     def test_spec_doc_change(self):
         p = os.path.join(self.e.arts, "spec.md")

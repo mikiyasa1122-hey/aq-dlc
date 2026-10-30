@@ -155,7 +155,9 @@ def new_run(project, title):
             rid = f"{base}-{n}"
     os.makedirs(os.path.join(d, "gate"), exist_ok=True)
     os.makedirs(artifacts_dir(d), exist_ok=True)
-    save_state(os.path.join(d, "state.json"), empty_state(rid, title))
+    st = empty_state(rid, title)
+    st["config_fp_registered"] = G.config_fp(config(project), project)
+    save_state(os.path.join(d, "state.json"), st)
     tmpl = read_text(os.path.join(project, ".aq-dlc", "run-template.md"), "# {title}\n")
     with open(os.path.join(d, "run.md"), "w", encoding="utf-8") as f:
         f.write(tmpl.replace("{title}", title).replace("{run_id}", rid).replace("{date}", now_iso()))
@@ -259,9 +261,11 @@ def graph_fp(state):
 class Ctx:
     """現在の仕様・設計・コード・検証条件の指紋をまとめて計算する。"""
 
-    def __init__(self, project, state, cfg=None):
+    def __init__(self, project, state, cfg=None, fresh=False):
         self.project, self.state = project, state
+        self.fresh = fresh  # True: キャッシュを使わずに全ファイルをハッシュし直す（判定・登録の時点）
         self.cfg = cfg or config(project)
+        self.config_fp = G.config_fp(self.cfg, self.project)
         self.rd = run_dir(project, state.get("run_id"))
         self.spec_hash = spec_hash(state, self.rd)
         self.design_hash = doc_hash(self.rd, "design")
@@ -274,7 +278,7 @@ class Ctx:
     def snap(self):
         if self._snap is None:
             prev = (self.state.get("gate") or {}).get("snapshot")
-            self._snap = G.snapshot(self.project, self.cfg, prev)
+            self._snap = G.snapshot(self.project, self.cfg, prev, fresh=self.fresh)
         return self._snap
 
     @property
@@ -308,6 +312,25 @@ def P(code, msg, route):
     return {"code": code, "msg": msg, "route": route}
 
 
+def open_violations(state):
+    return [v for v in state.get("violations", []) if not v.get("resolved")]
+
+
+def review_passed(rv):
+    """レビューが「合格」で、重大な指摘が0件で、形式が正しいときだけ True（読み取れない・矛盾は不合格）。"""
+    if not rv or not rv.get("valid"):
+        return False
+    if "passed" in rv:
+        return bool(rv["passed"])
+    return rv.get("verdict") == "合格" and rv.get("blocking", 0) == 0  # 旧形式の記録
+
+
+def current_review(state):
+    """最新のレビュー（有効なものに限る）。最新が無効なら、それより前の合格は使わない（安全側）。"""
+    rs = state.get("reviews", [])
+    return rs[-1] if rs and rs[-1].get("valid") else None
+
+
 def latest_review(state):
     rv = [r for r in state.get("reviews", []) if r.get("valid")]
     return rv[-1] if rv else None
@@ -339,6 +362,15 @@ def problems(ctx, stage="pr"):
     s, cfg = ctx.state, ctx.cfg
     auto = cfg["automation"]
     out = []
+    reg = s.get("config_fp_registered")
+    if not reg and s.get("status") in ("in_progress", "pr_ready"):
+        out.append(P("config_changed", "この run には設定の指紋が登録されていない（v0.5.1 より前に始まった run）。"
+                     "現在の設定を確認して受け入れる必要がある", "human"))
+        return out
+    if reg and reg != ctx.config_fp:
+        out.append(P("config_changed", "設定（.aq-dlc/config.json または ~/.aq-dlc/config.json）がエンジンのコマンド以外で"
+                     "変更された（指紋の対象・自動化の境界・チェックが変わった可能性）", "human"))
+        return out
     _idx, dups = id_index(s)
     if dups:
         out.append(P("dup_ids", f"IDが重複している: {', '.join(dups)}（結果が上書きされるため判定できない）",
@@ -400,9 +432,23 @@ def problems(ctx, stage="pr"):
     li = last_impl(s)
     if not li:
         out.append(P("impl_missing", "実装が未着手", "implementer"))
+        if open_violations(s):
+            out[-1]["msg"] += "（実装の前に担当外の変更の記録がある。実装担当が確認して取り込む）"
         return out
     if li.get("design_hash") != ctx.design_hash or li.get("spec_hash") != ctx.spec_hash:
         out.append(P("impl_stale", "仕様・設計の変更後に実装が更新されていない", "implementer"))
+        return out
+    if li.get("code_fp") and li["code_fp"] != ctx.code_fp:
+        diff = G.describe_diff(li.get("snapshot"), ctx.snap) if li.get("snapshot") else ""
+        out.append(P("code_unowned", "実装担当の登録後に、実装担当以外の操作でコードが変わった"
+                     + (f"（{diff}）" if diff else "") + "。実装担当に内容の確認と取り込みを依頼する",
+                     fix_route("implementer")))
+        return out
+    openv = open_violations(s)
+    if openv:
+        files = sorted({f for v in openv for f in v.get("files", [])})
+        out.append(P("violation_open", f"未対応の担当外の変更の記録が {len(openv)} 件ある（{', '.join(files[:3]) or '対象不明'}）。"
+                     "実装担当に確認と取り込みを依頼する", fix_route("implementer")))
         return out
     untraced = []
     for r in s["requirements"]:
@@ -420,15 +466,17 @@ def problems(ctx, stage="pr"):
     if out:
         return out
 
-    rv = latest_review(s)
-    if rv and rv.get("blocking", 0) > 0:
-        cats = {f.get("category") for f in rv.get("findings", []) if f.get("severity") == "重大"}
+    rv = current_review(s)
+    if rv and not review_passed(rv):
+        cats = {f.get("category") for f in rv.get("findings", []) if f.get("severity") == "重大"} or \
+            {f.get("category") for f in rv.get("findings", [])}
         if "仕様" in cats and spec.get("registered_seq", 0) < rv["seq"]:
             out.append(P("review_fix", f"レビュー#{rv['n']} の重大な指摘（仕様）が未対応", "requirements"))
         elif "設計" in cats and d.get("registered_seq", 0) < rv["seq"]:
             out.append(P("review_fix", f"レビュー#{rv['n']} の重大な指摘（設計）が未対応", "design"))
         elif li["seq"] < rv["seq"]:
-            out.append(P("review_fix", f"レビュー#{rv['n']} の重大な指摘 {rv['blocking']} 件が未対応",
+            out.append(P("review_fix", f"レビュー#{rv['n']} が「{rv.get('verdict')}」（重大 {rv['blocking']} 件・"
+                         f"軽微 {rv.get('minor', 0)} 件）。指摘が未対応",
                          fix_route("implementer")))
         if out:
             return out
@@ -443,6 +491,8 @@ def problems(ctx, stage="pr"):
         stale.append("コード（" + (diff or "内容が変化") + "）")
     if g.get("checks_fp") != ctx.checks_fp:
         stale.append("チェックの定義")
+    if g.get("config_fp") and g.get("config_fp") != ctx.config_fp:
+        stale.append("設定")
     vres = (g.get("results") or {}).get("verifications", {})
     changed_v, new_v = [], []
     for _r, _p, v in iter_verifications(s):
@@ -457,6 +507,11 @@ def problems(ctx, stage="pr"):
         stale.append(f"結果のない検証（{', '.join(new_v[:5])}）")
     if stale:
         out.append(P("gate_stale", "gate 後に変わったものがある: " + "、".join(stale), "gate"))
+        return out
+    md = g.get("modified_during_gate")
+    if md:
+        out.append(P("gate_modified", f"gate の実行中に変更があった（{md.get('summary')}）。この gate の結果は使えない",
+                     "gate" if li["seq"] > g["seq"] else fix_route("implementer")))
         return out
     failed = [n for n, r in g["results"]["checks"].items() if not r["pass"]]
     vfail = []
@@ -485,6 +540,8 @@ def problems(ctx, stage="pr"):
         rs.append("検証条件")
     if rv.get("checks_fp") != ctx.checks_fp:
         rs.append("チェックの定義")
+    if rv.get("config_fp") and rv.get("config_fp") != ctx.config_fp:
+        rs.append("設定")
     if rv.get("spec_hash") != ctx.spec_hash:
         rs.append("仕様")
     if rv.get("design_hash") != ctx.design_hash:
@@ -493,8 +550,9 @@ def problems(ctx, stage="pr"):
         out.append(P("review_stale", f"レビュー#{rv['n']} の後に {'・'.join(rs)} が変わった（再レビューが必要）",
                      "reviewer"))
         return out
-    if rv.get("blocking", 0) > 0:
-        out.append(P("review_blocking", f"レビュー#{rv['n']} の重大な指摘 {rv['blocking']} 件が残っている",
+    if not review_passed(rv):
+        out.append(P("review_blocking", f"レビュー#{rv['n']} が合格ではない（判定「{rv.get('verdict')}」・"
+                     f"重大 {rv['blocking']} 件）。修正して再レビューが必要",
                      fix_route("implementer")))
         return out
 
@@ -605,6 +663,10 @@ def instruction(p, ctx):
         if c == "spec_unapproved":
             return (head + "\n→ 人間が承認したら spec --approve \"<人間の返答の要約>\"。修正の要望なら "
                     "answer ではなく aq-dlc:requirements に修正を依頼する（依頼内容は question で記録してもよい）。")
+        if c == "config_changed":
+            return (head + "\n→ 変更前後の設定（git diff .aq-dlc/config.json、~/.aq-dlc/config.json）を確認し、ask を実行してから"
+                    "人間に変更を受け入れるか確認する。受け入れるなら config-accept \"<人間の返答の要約>\"、受け入れないなら"
+                    "人間に元に戻してもらう。")
         if c == "manual_unconfirmed":
             return (head + "\n→ ask \"<確認してほしいこと（まとめて）>\" を実行してから人間に確認し、"
                     "確認できたものを confirm <検証ID> \"<人間の返答の要約>\" で記録する。")
@@ -705,8 +767,15 @@ def describe_state(ctx):
         f"  登録{'済み' if d.get('registered_hash') and d.get('registered_hash') == ctx.design_hash else 'なし'}",
         f"実装: {('第' + str(li['n']) + '回') if li else '未着手'}  修正回数: {s.get('fix_iterations', 0)}",
         f"コード: {short(ctx.code_fp)}  チェック: {len(ctx.checks)}件",
-        f"レビュー: {('#' + str(rv['n']) + ' ' + rv['verdict'] + ' 重大' + str(rv['blocking'])) if rv else '未実施'}",
+        f"レビュー: {('#' + str(rv['n']) + ' ' + str(rv.get('verdict')) + ' 重大' + str(rv['blocking'])) if rv else '未実施'}",
     ]
+    g = s.get("gate") or {}
+    if g.get("modified_during_gate"):
+        lines.append(f"  ! 最後の gate（{g.get('stamp')}）は、gate の実行中に変更があったため不合格: "
+                     f"{g['modified_during_gate'].get('summary')}")
+    vio = s.get("violations") or []
+    if vio:
+        lines.append(f"  ! 担当外の変更の記録: {len(vio)} 件（最新: {vio[-1]['role']} の Bash で {vio[-1]['count']} 件）")
     bad = [r for r in s.get("reviews", []) if not r.get("valid")]
     if bad and (not rv or bad[-1]["n"] > rv["n"]):
         lines.append(f"  ! 最後のレビュー#{bad[-1]['n']} は無効: {bad[-1].get('invalid_reason')}")

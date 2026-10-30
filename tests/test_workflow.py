@@ -37,7 +37,7 @@ class WorkflowTest(unittest.TestCase):
         self.assertFalse(denied(res), res)
         self.assertIs(res["hookSpecificOutput"]["updatedInput"]["run_in_background"], False)
         ctx = e.start("reviewer")["hookSpecificOutput"]["additionalContext"]
-        self.assertIn("判定: 合格 または 要修正", ctx)
+        self.assertIn("判定: <合格 か 要修正 の1語だけ>", ctx)
         self.assertIsNone(e.stop("reviewer", REVIEW_FAIL))
         s = e.state()
         self.assertEqual(s["reviews"][-1]["blocking"], 1)
@@ -45,7 +45,7 @@ class WorkflowTest(unittest.TestCase):
         self.assertTrue(os.path.exists(os.path.join(e.arts, "review-1.md")))
         nxt = e.next()
         self.assertIn("実装", nxt)
-        self.assertIn("重大な指摘", nxt)
+        self.assertIn("要修正", nxt)
         # 修正: 指摘への対応がないと終了できない
         self.assertFalse(denied(e.spawn("implementer")))
         brief = e.start("implementer")["hookSpecificOutput"]["additionalContext"]
@@ -68,7 +68,7 @@ class WorkflowTest(unittest.TestCase):
         e.start("reviewer")
         self.assertIsNone(e.stop("reviewer", REVIEW_PASS))
         self.assertIn("Memory", e.next())
-        e.aq("memory-done")
+        e.aq("memory-done", "--skipped", "テスト用の run のため保存する学びなし")
         out = e.aq("complete")
         self.assertIn("complete", out)
         self.assertIsNone(e.hook("stop", {}))

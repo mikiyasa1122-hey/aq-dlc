@@ -29,8 +29,10 @@ USAGE = """AQ-DLC エンジン
 実装:   bind <検証ID> [--command "..."] [--checks a,b] [--test "..."] [--level L] / impl-map <要求ID> --files a,b
 統括:   next / status / spec [--present | --approve "<人間の返答の要約>"] / answer <質問ID> "<回答>"
         ask "<質問>" / resume / wait "<理由>" / confirm <検証ID> "<人間の確認内容>" / escalation [<ID> --resolve "<対応>"]
-        gate [--after-merge] / ci [--wait 分] / memory [--tags a,b] / memory-done / complete / abort
-参照:   trace / history [--since N] / show <ID> / checks / check
+        gate [--after-merge] / ci [--wait 分] / complete / abort
+Memory: memory [--tags a,b] [--record] / memory-use <ID> --result helped|not_applicable|harmful
+        memory-done [--saved ID,..] [--merged ID,..] [--skipped "<理由>"]
+参照:   trace / history [--since N] / show <ID> / checks / check / metrics [--json]
 すべてのコマンドに --project <パス> を付けられる（省略時はカレントから探す）。"""
 
 
@@ -277,9 +279,12 @@ def cmd_add_check(args):
     if timeout:
         entry["timeout_sec"] = int(timeout)
     cfg["checks"] = [c for c in cfg.get("checks", []) if c.get("name") != name] + [entry]
-    save_json(path, cfg)
     state, spath = load_state(project)
+    if state and state.get("config_fp_registered") and state["config_fp_registered"] != G.config_fp(config(project), project):
+        die("設定がエンジンのコマンド以外で変更されています。先に人間の確認（config-accept）を済ませてください。")
+    save_json(path, cfg)
     if state:
+        state["config_fp_registered"] = G.config_fp(config(project), project)
         log(state, project, "check.update" if old else "check.add", {"name": name, "before": old, "after": entry})
         save_state(spath, state)
     info(f"チェックを登録しました: {name}（{kind}）→ {command}")
@@ -293,9 +298,12 @@ def cmd_remove_check(args):
     cfg = load_json(path, {}) or {}
     old = next((c for c in cfg.get("checks", []) if c.get("name") == args[0]), None)
     cfg["checks"] = [c for c in cfg.get("checks", []) if c.get("name") != args[0]]
-    save_json(path, cfg)
     state, spath = load_state(project)
+    if state and state.get("config_fp_registered") and state["config_fp_registered"] != G.config_fp(config(project), project):
+        die("設定がエンジンのコマンド以外で変更されています。先に人間の確認（config-accept）を済ませてください。")
+    save_json(path, cfg)
     if state and old:
+        state["config_fp_registered"] = G.config_fp(config(project), project)
         log(state, project, "check.remove", {"name": args[0], "before": old})
         save_state(spath, state)
     info(f"{'削除しました' if old else '見つかりませんでした'}: {args[0]}")
@@ -400,7 +408,10 @@ def cmd_answer(args):
 
 def cmd_ask(args):
     def fn(project, s, a):
+        if not " ".join(a).strip():
+            die('使い方: ask "<人間に確認すること>"（質問の内容を必ず書く）')
         s.update(awaiting_human=True, question=" ".join(a), asked_seq=bump(s))
+        s["asks_total"] = int(s.get("asks_total", 0)) + 1
         info("人間への確認待ちとして記録しました（返答を得たら resume）。")
     mutate(args, fn)
 
@@ -434,6 +445,21 @@ def cmd_confirm(args):
         v.update(confirmed_by="human", confirm_note=" ".join(a[1:]), confirmed_seq=bump(s))
         log(s, project, "confirm", {"id": a[0], "note": v["confirm_note"]})
         info(f"人間の確認として記録しました: {a[0]}")
+    mutate(args, fn)
+
+
+def cmd_config_accept(args):
+    """config-accept "<人間の返答の要約>" — エンジン以外で変わった設定を、人間が確認したうえで受け入れる"""
+    def fn(project, s, a):
+        note = " ".join(a).strip()
+        if not note:
+            die('使い方: config-accept "<人間の返答の要約>"（ask で変更内容を人間に確認した後に実行する）')
+        if not s.get("asked_seq") or last_human_seq(s) <= s["asked_seq"]:
+            die("ask の後に人間の返答が記録されていません。設定の変更内容を ask で人間に確認してから実行してください。")
+        new = G.config_fp(config(project), project)
+        log(s, project, "config.accept", {"before": s.get("config_fp_registered"), "after": new, "note": note})
+        s["config_fp_registered"] = new
+        info("設定の変更を、人間の確認済みとして受け入れました（gate と独立レビューはやり直しになります）。")
     mutate(args, fn)
 
 
@@ -481,21 +507,43 @@ def cmd_gate(args):
     try:
         stamp = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
         info(f"gate {stamp}  ({project})")
-        before = ctx.snap
+        # 実行開始時のコード・チェック定義・検証条件（gate の結果はこれに紐付ける）
+        before = G.snapshot(project, cfg, fresh=True)
+        checks_fp_before = G.checks_fp(cfg)
+        config_fp_before = G.config_fp(cfg, project)
+        vfp_before = {v["id"]: G.verification_fp(v, cfg) for _r, _p, v in iter_verifications(s)}
+        t0 = time.time()
         results, ok = G.run_gate(project, s, cfg, iter_verifications, os.path.join(ctx.rd, "gate"), stamp,
                                  after_merge)
-        after = G.snapshot(project, cfg, before)
+        dur = round(time.time() - t0, 1)
+        cfg_after = config(project)
+        after = G.snapshot(project, cfg, fresh=True)
     finally:
         try:
             os.remove(lock)
         except OSError:
             pass
     s, spath = load_state(project)  # gate 実行中に他の記録が入っていてもよいように読み直す
-    modified = G.describe_diff(before, after)
-    s["gate"] = {"seq": bump(s), "stamp": stamp, "ran_at": now_iso(), "after_merge": after_merge,
-                 "code_fp": G.code_fp(after), "snapshot": after, "checks_fp": G.checks_fp(cfg),
-                 "graph_fp": ctx.graph_fp, "checks_pass": ok, "results": results,
-                 "modified_during_gate": modified or None}
+    c, a, r = G.snapshot_diff(before, after)
+    changed_defs = []
+    if G.checks_fp(cfg_after) != checks_fp_before:
+        changed_defs.append("チェックの定義")
+    if G.config_fp(cfg_after, project) != config_fp_before:
+        changed_defs.append("設定")
+    vfp_after = {v["id"]: G.verification_fp(v, cfg_after) for _r, _p, v in iter_verifications(s)}
+    if vfp_after != vfp_before:
+        changed_defs.append("検証条件")
+    modified = None
+    if c or a or r or changed_defs:
+        modified = {"files": c + a + r, "changed": c, "added": a, "removed": r, "definitions": changed_defs,
+                    "summary": G.describe_diff(before, after) or "、".join(changed_defs)}
+        ok = False  # 検証したものと結果を紐付けるものが一致しないため不合格
+    s["gate"] = {"seq": bump(s), "stamp": stamp, "ran_at": now_iso(), "after_merge": after_merge, "sec": dur,
+                 "code_fp": G.code_fp(before), "code_fp_after": G.code_fp(after), "snapshot": before,
+                 "checks_fp": checks_fp_before, "config_fp": config_fp_before, "graph_fp": ctx.graph_fp, "checks_pass": ok, "results": results,
+                 "modified_during_gate": modified}
+    s.setdefault("gate_history", []).append({"stamp": stamp, "pass": ok, "sec": dur, "after_merge": after_merge,
+                                             "modified": bool(modified)})
     if after_merge:
         s["after_merge_gate"] = True
     s["stop_blocks"] = 0
@@ -504,7 +552,13 @@ def cmd_gate(args):
     if not cfg.get("checks"):
         print("  ! チェックが登録されていません（完了条件を満たせません）")
     if modified:
-        print(f"  ! gate の実行中にファイルが変わりました: {modified}（テストが追跡対象のファイルを書き換えていないか確認）")
+        print(f"  ! gate の実行中に変更がありました: {modified['summary']}")
+        print("    検証したものと結果を紐付けるものが一致しないため、gate を不合格にしました。"
+              "テストやビルドが追跡対象のファイルを書き換えていないか確認してください。")
+        log_dir = os.path.join(ctx.rd, "gate")
+        write_text(os.path.join(log_dir, f"{stamp}-modified.log"),
+                   "\n".join(["gate の実行中に変わったもの"] + [f"変更: {x}" for x in c] + [f"追加: {x}" for x in a]
+                             + [f"削除: {x}" for x in r] + [f"定義: {x}" for x in changed_defs]) + "\n")
     info(f"gate 結果: {'合格' if ok else '不合格'}")
 
 
@@ -523,19 +577,11 @@ def cmd_ci(args):
         sys.exit(1)
 
 
-def cmd_memory_done(args):
-    def fn(project, s, a):
-        s["memory_done"] = True
-        log(s, project, "memory-done", {})
-        info("Memory 整理を完了として記録しました。")
-    mutate(args, fn)
-
-
 def cmd_complete(args):
     project, s, spath = open_state(args)
     if running_agents(s):
         die("サブエージェントの実行中は完了にできません。")
-    ctx = Ctx(project, s)
+    ctx = Ctx(project, s, fresh=True)
     probs = problems(ctx, "pr")
     if probs:
         print("[aq-dlc] まだ PR を出せる状態ではありません:\n  - " + "\n  - ".join(p["msg"] for p in probs))
@@ -550,8 +596,9 @@ def cmd_complete(args):
                 "\n→ マージ後: 既定ブランチを取り込み → gate --after-merge → 人の確認は ask でまとめて1回 → confirm → complete")
         return
     s["status"] = "complete"
+    s["metrics"] = collect_metrics(s)
     save_state(spath, s)
-    info("完了条件を満たしました。status を complete にしました。")
+    info("完了条件を満たしました。status を complete にしました。（運用の指標は metrics で確認）")
 
 
 def cmd_abort(args):
@@ -592,7 +639,7 @@ def cmd_status(args):
 def cmd_check(args):
     project, s, _ = open_state(args)
     stage = "final" if s.get("status") == "pr_ready" else "pr"
-    probs = problems(Ctx(project, s), stage)
+    probs = problems(Ctx(project, s, fresh=True), stage)
     if probs:
         print("[aq-dlc] 完了条件を満たしていません:\n  - " + "\n  - ".join(p["msg"] for p in probs))
         sys.exit(1)
@@ -623,6 +670,72 @@ def cmd_show(args):
         die("使い方: show <ID>")
     kind, node, parent = find(s, args[0])
     print(json.dumps({"kind": kind, "parent": parent, **node}, ensure_ascii=False, indent=2))
+
+
+def _secs(a, b):
+    try:
+        return (_dt.datetime.fromisoformat(b) - _dt.datetime.fromisoformat(a)).total_seconds()
+    except (TypeError, ValueError):
+        return 0
+
+
+def collect_metrics(s):
+    hist = s["agents"].get("history", [])
+    roles = {}
+    for h in hist:
+        r = roles.setdefault(h["role"], {"runs": 0, "sec": 0.0, "ok": 0, "stop_blocks": 0, "tokens": None})
+        r["runs"] += 1
+        r["ok"] += 1 if h.get("ok") else 0
+        r["sec"] += h.get("sec") or _secs(h.get("start"), h.get("end"))
+        r["stop_blocks"] += h.get("stop_blocks", 0)
+        if h.get("tokens"):
+            t = r["tokens"] or {"input": 0, "output": 0, "cache_read": 0, "cache_create": 0}
+            for k in t:
+                t[k] += h["tokens"].get(k, 0)
+            r["tokens"] = t
+    gh = s.get("gate_history", [])
+    reviews = s.get("reviews", [])
+    end = s.get("closed_at") or now_iso()
+    return {
+        "run_sec": round(_secs(s.get("created"), end)),
+        "roles": roles,
+        "gate": {"runs": len(gh), "failed": sum(1 for g in gh if not g.get("pass")),
+                 "modified_during": sum(1 for g in gh if g.get("modified")),
+                 "sec": round(sum(g.get("sec") or 0 for g in gh), 1)},
+        "reviews": {"runs": len(reviews), "passed": sum(1 for r in reviews if r.get("passed")),
+                    "needs_fix": sum(1 for r in reviews if r.get("valid") and not r.get("passed")),
+                    "invalid": sum(1 for r in reviews if not r.get("valid"))},
+        "fix_iterations": s.get("fix_iterations", 0),
+        "human": {"replies": len(s.get("human_events", [])), "asks": s.get("asks_total", 0)},
+        "stop_blocks_total": s.get("stop_blocks_total", 0),
+        "violations": len(s.get("violations", [])),
+        "orchestrator_tokens": A.transcript_usage(s.get("session_transcript")),
+    }
+
+
+def cmd_metrics(args):
+    as_json = pop_flag(args, "--json")
+    project, s, _ = open_state(args)
+    m = collect_metrics(s)
+    if as_json:
+        print(json.dumps(m, ensure_ascii=False, indent=2))
+        return
+
+    def tok(t):
+        return "取得できず" if not t else f"入力 {t['input']:,} / 出力 {t['output']:,} / キャッシュ読込 {t['cache_read']:,}"
+    print(f"run 全体の経過時間: {m['run_sec'] // 60} 分 {m['run_sec'] % 60} 秒")
+    print("| 担当 | 実行回数 | 再実行 | 所要時間 | 終了の差し戻し | トークン |\n|---|---|---|---|---|---|")
+    for role, r in m["roles"].items():
+        print(f"| {ROLE_LABEL.get(role, role)} | {r['runs']} | {max(0, r['runs'] - 1)} | {round(r['sec'])} 秒 | "
+              f"{r['stop_blocks']} | {tok(r['tokens'])} |")
+    g = m["gate"]
+    print(f"Quality Gate: {g['runs']} 回（不合格 {g['failed']} 回、うち実行中の変更 {g['modified_during']} 回、計 {g['sec']} 秒）")
+    rv = m["reviews"]
+    print(f"独立レビュー: {rv['runs']} 回（合格 {rv['passed']}・要修正 {rv['needs_fix']}・無効 {rv['invalid']}）"
+          f"  修正ループ: {m['fix_iterations']} 回")
+    print(f"人間の介入: 返答 {m['human']['replies']} 回・確認依頼 {m['human']['asks']} 回  "
+          f"Stop hook による継続: {m['stop_blocks_total']} 回  担当外の変更: {m['violations']} 件")
+    print(f"統括のトークン: {tok(m['orchestrator_tokens'])}")
 
 
 def cmd_doctor(args):
@@ -680,6 +793,10 @@ def hook_context(payload):
     cwd = payload.get("cwd") or os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
     project = active_project_for(cwd)
     state, spath = (load_state(project) if project else (None, None))
+    tp = payload.get("transcript_path")
+    if state and tp and not payload.get("agent_type") and state.get("session_transcript") != tp:
+        state["session_transcript"] = tp  # 統括の会話記録（トークンの集計に使う）
+        save_state(spath, state)
     return cwd, project, state, spath
 
 
@@ -704,6 +821,24 @@ def hook_pre_bash(payload):
     why = A.check_bash(role, cmd, project, state, cfg)
     if why:
         return A.deny(why)
+    # 実装担当以外の Bash は、実行前のコードと設定の状態をプロジェクトの外に記録し、実行後に比べる。
+    # run がない間も「記録した」こと自体は残す（実行後に記録が消えていたら改ざんとして扱うため）。
+    if role != "implementer":
+        sdir = A.bash_snapshot_dir(project)
+        if os.path.isdir(sdir):  # 対応する PostToolUse が来なかった古い記録を掃除する
+            for f in os.listdir(sdir):
+                fp = os.path.join(sdir, f)
+                try:
+                    if time.time() - os.path.getmtime(fp) > 3600:
+                        os.remove(fp)
+                except OSError:
+                    pass
+        active = bool(state and state.get("status") in ("in_progress", "pr_ready"))
+        prev = (state.get("gate") or {}).get("snapshot") if state else None
+        save_json(A.bash_snapshot_path(project, payload.get("tool_use_id")),
+                  {"role": role, "cmd": cmd[:2000], "active": active,
+                   "snapshot": G.snapshot(project, cfg, prev) if active else None,
+                   "ignore_dirs": list(cfg["gate"]["ignore_dirs"]), "config_fp": G.config_fp(cfg, project)})
     if re.search(r"\b(git|gh)\b|api\.github\.com", cmd):
         try:
             reasons = gitops.guard_reasons(cmd, project, gitops.current_branch, gitops.remote_has_branch)
@@ -716,6 +851,82 @@ def hook_pre_bash(payload):
     return None
 
 
+def hook_post_bash(payload):
+    """実装担当以外の Bash がコード・テスト・設定を変えていないか。
+
+    リダイレクト・スクリプト・変数展開などの書き方に関係なく、実行前後のファイル内容で判定する。
+    """
+    role = A.role_of(payload.get("agent_type"))
+    if role == "implementer":
+        return None
+    cwd, project, state, spath = hook_context(payload)
+    if not project:
+        return None
+    snap_path = A.bash_snapshot_path(project, payload.get("tool_use_id"))
+    pre = load_json(snap_path, None)
+    active = bool(state and state.get("status") in ("in_progress", "pr_ready"))
+    cfg = config(project)
+    if pre is None:
+        if not active:
+            return None
+        v = {"role": role, "at": now_iso(), "cmd": str((payload.get("tool_input") or {}).get("command", ""))[:500],
+             "files": [], "count": 0, "kind": "tamper",
+             "note": "実行前の記録が見つからない（記録の削除・改ざんの可能性）"}
+    else:
+        notes = []
+        now_fp = G.config_fp(cfg, project)
+        if pre.get("config_fp") and pre["config_fp"] != now_fp and not (state and state.get("config_fp_registered") == now_fp):
+            # エンジンのコマンド（add-check など）で登録された変更は除く
+            notes.append("設定（config.json または .claude の設定・定義）が変更された")
+        files = []
+        if pre.get("snapshot") is not None:
+            # 実行前と同じ対象で比べる（設定で対象を外す改ざんをしても、ファイルの変更は見える）
+            same = dict(cfg, gate=dict(cfg["gate"], ignore_dirs=pre.get("ignore_dirs", cfg["gate"]["ignore_dirs"])))
+            # 変更の比較は ctime・inode 付きのキャッシュで十分（utime で ctime は戻せない）。
+            # 全ファイルのハッシュのし直しは、判定と登録の時点で行う（hook の時間制限を超えないため）
+            # Windows の ctime は作成時刻で書き換えを表さないため、Windows では全ファイルをハッシュし直す
+            after = G.snapshot(project, same, pre["snapshot"], fresh=(os.name == "nt"))
+            c, a, r = G.snapshot_diff(pre["snapshot"], after)
+            files = c + a + r
+        if (not files and not notes) or (not active and not notes):
+            try:
+                os.remove(snap_path)
+            except OSError:
+                pass
+            return None
+        v = A.detect_bash_changes(role, pre.get("cmd", ""), {}, {}, project) or \
+            {"role": role, "at": now_iso(), "cmd": pre.get("cmd", "")[:500], "kind": "write"}
+        v.update(files=files[:50], count=len(files))
+        if A.GIT_SYNC.search(pre.get("cmd", "")):
+            v["kind"] = "git"
+        if notes and not files:
+            v["kind"] = "config"
+        if notes:
+            v["note"] = "、".join(notes)
+    try:
+        os.remove(snap_path)
+    except OSError:
+        pass
+    state, spath = load_state(project)
+    if not state:
+        return None
+    v["seq"] = bump(state)
+    if v["kind"] == "config":
+        v["resolved"] = {"by": "config_changed で人間が確認する"}  # 設定の変更は config_changed（人間の確認）で扱う
+    state.setdefault("violations", []).append(v)
+    save_state(spath, state)
+    who = ROLE_LABEL.get(role, "統括")
+    detail = f"{v['count']} 件: {', '.join(v['files'][:5])}" if v.get("files") else v.get("note", "")
+    reason = (f"AQ-DLC: 担当外の変更を検出しました（{who} の Bash: {detail}）。"
+              "run の実行中にコードやテストを変えられるのは実装担当だけで、設定はエンジンのコマンドでだけ変えます。"
+              "この変更は記録され、実装担当の確認・取り込み（設定なら人間の確認）と gate・独立レビューのやり直しが"
+              "済むまで、レビュー・完了に進めません。")
+    if v["kind"] == "git":
+        reason += "（git の操作による作業ツリーの変化も、取り込みの確認が必要です）"
+    return {"decision": "block", "reason": reason,
+            "hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": reason}}
+
+
 def hook_pre_write(payload):
     ti = payload.get("tool_input") or {}
     path = ti.get("file_path") or ti.get("notebook_path") or ti.get("path")
@@ -724,6 +935,7 @@ def hook_pre_write(payload):
         return None
     if not os.path.isabs(path):
         path = os.path.join(cwd, path)
+    project = os.path.realpath(project)
     why = A.check_write(A.role_of(payload.get("agent_type")), path, project, state, config(project))
     return A.deny(why) if why else None
 
@@ -778,7 +990,12 @@ def hook_stop(payload):
     if w and time.time() < w.get("until", 0):
         return None
     cfg = config(project)
-    ctx = Ctx(project, state, cfg)
+    ctx = Ctx(project, state, cfg, fresh=state.get("status") == "complete")
+    total_cap = int(cfg["automation"].get("max_total_continues", 200))
+    if int(state.get("stop_blocks_total", 0)) >= total_cap and state.get("status") != "complete":
+        print(f"[aq-dlc] run 全体での自動継続の上限（{total_cap}回）に達したため停止を許可しました。"
+              "状況を確認して人間が判断してください。", file=sys.stderr)
+        return None
     if state.get("status") == "complete":
         final = problems(ctx, "final")
         if not final:
@@ -796,6 +1013,7 @@ def hook_stop(payload):
         return None
     phase, nxt, _probs = next_action(ctx)
     state["stop_blocks"] = state.get("stop_blocks", 0) + 1
+    state["stop_blocks_total"] = int(state.get("stop_blocks_total", 0)) + 1
     save_state(spath, state)
     reason = (f"AQ-DLC: run が進行中です（{project} / フェーズ: {phase}）。\n次: {nxt}\n"
               "人間の判断が必要なら ask を実行してから質問してください。中断するなら abort。\n"
@@ -843,11 +1061,29 @@ def hook_session_start(payload):
 HOOKS = {
     "session-start": hook_session_start, "user-prompt": hook_user_prompt, "pre-bash": hook_pre_bash,
     "pre-write": hook_pre_write, "pre-agent": hook_pre_agent, "post-ask": hook_post_ask,
+    "post-bash": hook_post_bash,
     "subagent-start": hook_subagent_start, "subagent-stop": hook_subagent_stop, "stop": hook_stop,
 }
 LEGACY_HOOKS = {"stop-hook": "stop", "guard-hook": "pre-bash", "session-hook": "session-start",
                 "agent-start-hook": None, "agent-stop-hook": None}
 FAIL_CLOSED = {"pre-bash"}
+
+
+def _record_hook_error(payload, err):
+    """検出の処理で例外が起きたら、見逃さないように「確認が必要な変更」として記録する（安全側）。"""
+    try:
+        cwd = payload.get("cwd") or os.getcwd()
+        project = active_project_for(cwd)
+        state, spath = load_state(project) if project else (None, None)
+        if state and state.get("status") in ("in_progress", "pr_ready"):
+            state.setdefault("violations", []).append({
+                "role": A.role_of(payload.get("agent_type")), "at": now_iso(), "seq": bump(state), "kind": "error",
+                "cmd": str((payload.get("tool_input") or {}).get("command", ""))[:500], "files": [], "count": 0,
+                "note": f"変更の検出処理でエラー: {err}"})
+            save_state(spath, state)
+    except Exception:  # noqa: BLE001
+        pass
+    print(f"[aq-dlc] 変更の検出でエラーが発生したため、確認が必要な変更として記録しました: {err}", file=sys.stderr)
 
 
 def run_hook(name):
@@ -865,6 +1101,9 @@ def run_hook(name):
     except SystemExit:
         raise
     except Exception as e:  # noqa: BLE001
+        if name == "post-bash":
+            _record_hook_error(payload, e)
+            return
         if name in FAIL_CLOSED and gitops.dangerous_words((payload.get("tool_input") or {}).get("command", "") or ""):
             emit(A.deny(f"ガードの判定中にエラーが発生したため、安全のため止めました（{e}）"))
             return
@@ -882,9 +1121,9 @@ COMMANDS = {
     "bind": cmd_bind, "impl-map": cmd_impl_map,
     "spec": cmd_spec, "answer": cmd_answer, "ask": cmd_ask, "resume": cmd_resume, "wait": cmd_wait,
     "confirm": cmd_confirm, "escalation": cmd_escalation, "gate": cmd_gate, "ci": cmd_ci,
-    "memory": memory.cmd_memory, "memory-done": cmd_memory_done, "complete": cmd_complete, "abort": cmd_abort,
+    "memory": memory.cmd_memory, "memory-done": memory.cmd_memory_done, "memory-use": memory.cmd_memory_use, "complete": cmd_complete, "abort": cmd_abort,
     "next": cmd_next, "status": cmd_status, "check": cmd_check, "trace": cmd_trace, "history": cmd_history,
-    "show": cmd_show,
+    "show": cmd_show, "metrics": cmd_metrics, "config-accept": cmd_config_accept,
 }
 REMOVED = {"review": "レビュー結果は aq-dlc:reviewer の終了時にエンジンが自動で記録します（手動では記録できません）。",
            "phase": "フェーズは状態から自動で決まります（next で確認）。",

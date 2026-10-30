@@ -7,6 +7,7 @@
 どれかが gate 実行時と変われば、その gate 結果は使えない。
 """
 import json
+import re
 import os
 import shutil
 import time
@@ -19,34 +20,64 @@ LEVELS = {"unit", "integration", "e2e", "manual", "other"}
 
 
 # ------------------------------------------------------------------ code fingerprint
+# 依存関係・キャッシュ（どの階層にあってもソースではない）
+DEP_DIRS = {".git", ".aq-dlc", ".claude", "node_modules", ".venv", "venv", "__pycache__", ".pytest_cache",
+            ".mypy_cache", ".ruff_cache", ".gradle", ".tox", ".nox"}
+
+
 def source_files(project, cfg):
-    ignore = set(cfg["gate"]["ignore_dirs"]) | {".aq-dlc", ".claude", ".git"}
-    files = None
+    """指紋の対象のファイル。
+
+    - git で追跡しているファイルは、常に対象（ignore_dirs や .gitignore の設定で外れない）
+    - 追跡していないファイルは、.gitignore 済みを除く
+    - ignore_dirs（ビルド出力など）は、プロジェクト直下のフォルダ名にだけ適用する（src/build/ のような
+      ソースのフォルダを誤って外さない）。依存関係・キャッシュのフォルダはどの階層でも外す
+    """
+    top_ignore = set(cfg["gate"]["ignore_dirs"])
+    tracked, others = None, None
     if shutil.which("git") and os.path.isdir(project):
         code, out = sh_run("git rev-parse --is-inside-work-tree", project, 30)
         if code == 0 and out.strip() == "true":
-            code, out = sh_run("git ls-files -co --exclude-standard -z", project, 120)
-            if code == 0:
-                files = [f for f in out.split("\0") if f.strip()]
-    if files is None:
-        files = []
+            c1, o1 = sh_run("git ls-files -c -z", project, 120)
+            c2, o2 = sh_run("git ls-files -o --exclude-standard -z", project, 120)
+            if c1 == 0 and c2 == 0:
+                tracked = [f for f in o1.split("\0") if f.strip()]
+                others = [f for f in o2.split("\0") if f.strip()]
+    if tracked is None:
+        tracked, others = [], []
         for dirpath, dirnames, filenames in os.walk(project):
-            dirnames[:] = [d for d in dirnames if d not in ignore]
+            rel_dir = os.path.relpath(dirpath, project)
+            dirnames[:] = [d for d in dirnames if d not in DEP_DIRS and not (rel_dir == "." and d in top_ignore)]
             for name in filenames:
-                files.append(os.path.relpath(os.path.join(dirpath, name), project))
+                others.append(os.path.relpath(os.path.join(dirpath, name), project))
     out = set()
-    for f in files:
+    for f in tracked:
         rel = f.replace(os.sep, "/").strip()
         parts = rel.split("/")
-        if any(p in ignore for p in parts[:-1]):
+        if parts[0] in (".aq-dlc", ".claude", ".git"):
+            continue
+        out.add(rel)
+    for f in others:
+        rel = f.replace(os.sep, "/").strip()
+        parts = rel.split("/")
+        if any(p in DEP_DIRS for p in parts[:-1]) or (len(parts) > 1 and parts[0] in top_ignore):
             continue
         out.add(rel)
     return sorted(out)
 
 
-def snapshot(project, cfg, previous=None):
-    """{相対パス: [サイズ, 更新時刻, sha1]}。サイズと更新時刻が同じなら前回のハッシュを再利用する。"""
-    previous = previous or {}
+def _stat_key(st):
+    # 更新時刻だけでなく ctime（utime で戻せない）と inode も比べる
+    return [st.st_size, st.st_mtime_ns, getattr(st, "st_ctime_ns", 0), getattr(st, "st_ino", 0)]
+
+
+def snapshot(project, cfg, previous=None, fresh=False):
+    """{相対パス: [サイズ, 更新時刻, sha1, ctime, inode]}。
+
+    fresh=True ならキャッシュを使わず全ファイルをハッシュし直す（gate の開始・終了、各工程の登録、完了判定）。
+    fresh=False なら、サイズ・更新時刻・ctime・inode がすべて前回と同じファイルだけハッシュを再利用する。
+    """
+    previous = {} if fresh else (previous or {})
     snap = {}
     for rel in source_files(project, cfg):
         p = os.path.join(project, rel)
@@ -56,12 +87,13 @@ def snapshot(project, cfg, previous=None):
             continue
         if not os.path.isfile(p):
             continue
+        key = _stat_key(st)
         old = previous.get(rel)
-        if old and old[0] == st.st_size and abs(old[1] - st.st_mtime) < 1e-6:
+        if old and len(old) == 5 and [old[0], old[1], old[3], old[4]] == key:
             snap[rel] = old
             continue
         try:
-            snap[rel] = [st.st_size, st.st_mtime, sha1_file(p)]
+            snap[rel] = [key[0], key[1], sha1_file(p), key[2], key[3]]
         except OSError:
             continue
     return snap
@@ -100,6 +132,35 @@ def check_fp(c, cfg):
 
 def checks_fp(cfg):
     return fingerprint(sorted(check_fp(c, cfg) for c in cfg.get("checks", [])))
+
+
+PROTECTED_CLAUDE = re.compile(r"^\.claude/(settings[^/]*\.json$|agents/|hooks/|skills/|commands/)")
+
+
+def protected_files_fp(project):
+    """.claude の設定（hook の無効化など）・エージェント定義・hook・Skill の内容の指紋。"""
+    root = os.path.join(project, ".claude")
+    items = []
+    if os.path.isdir(root):
+        for dirpath, _d, files in os.walk(root):
+            for name in files:
+                p = os.path.join(dirpath, name)
+                rel = os.path.relpath(p, project).replace(os.sep, "/")
+                if PROTECTED_CLAUDE.match(rel):
+                    try:
+                        items.append([rel, sha1_file(p)])
+                    except OSError:
+                        items.append([rel, "unreadable"])
+    return fingerprint(sorted(items))
+
+
+def config_fp(cfg, project=None):
+    """実際に使われる設定の指紋: 全体設定＋プロジェクト設定、および .claude の設定・定義。
+
+    指紋の対象・自動化の境界・hook の無効化などの改ざんを検出する。
+    """
+    return fingerprint({"cfg": {k: v for k, v in cfg.items() if not k.startswith("_")},
+                        "claude": protected_files_fp(project) if project else None})
 
 
 def verification_fp(v, cfg):
@@ -247,3 +308,50 @@ def print_ci(rec):
     info(f"CI（{rec['sha'][:7]}）: {label}")
     for r in rec["runs"]:
         print(f"  {r.get('name')}: {r.get('conclusion') or r.get('status')}  {r.get('url')}")
+
+
+# ------------------------------------------------------------------ テストの兆候（判断材料。合否は決めない）
+TEST_FILE = re.compile(r"(^|/)(tests?|__tests__|spec|specs|e2e)/|(_test|\.test|\.spec|Test|Tests)\.[A-Za-z]+$"
+                       r"|(^|/)test_[^/]+\.py$")
+SKIP_RE = re.compile(r"\.skip\s*\(|\bxit\s*\(|\bxdescribe\s*\(|\bxtest\s*\(|@(unittest\.)?skip|pytest\.mark\.(skip|xfail)"
+                     r"|\bt\.Skip\(|#\[ignore\]|@Disabled\b|@Ignore\b|\.todo\s*\(|\.fixme\s*\(")
+ONLY_RE = re.compile(r"\b(it|test|describe)\.only\s*\(|\bfit\s*\(|\bfdescribe\s*\(")
+ASSERT_RE = re.compile(r"assert|expect\s*\(|\.should\b|\.to(Be|Equal|Have|Contain|Match|Throw)|require\.|"
+                       r"\bt\.(Error|Fatal|Fail)|XCTAssert|check\s*\(|verify\s*\(", re.I)
+TEST_DEF_RE = re.compile(r"\bdef\s+test_|\b(it|test)\s*\(|\bfunc\s+Test|#\[test\]|@Test\b|\bfn\s+test_")
+CODE_EXT = (".py", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".go", ".rs", ".java", ".kt", ".swift", ".rb",
+            ".php", ".cs", ".vue", ".svelte")
+
+
+def test_signals(project, files):
+    """skip・.only・アサーションのないテストファイルを機械的に検出する（意味の判断はレビュー担当が行う）。"""
+    out = []
+    for rel in files:
+        if not rel.endswith(CODE_EXT) or not TEST_FILE.search(rel):
+            continue
+        try:
+            with open(os.path.join(project, rel), encoding="utf-8", errors="replace") as f:
+                text = f.read(400000)
+        except OSError:
+            continue
+        if SKIP_RE.search(text):
+            out.append({"file": rel, "issue": "skip / todo / xfail されたテストがある"})
+        if ONLY_RE.search(text):
+            out.append({"file": rel, "issue": ".only などで一部のテストだけを実行する指定がある"})
+        if TEST_DEF_RE.search(text) and not ASSERT_RE.search(text):
+            out.append({"file": rel, "issue": "テストの定義はあるが、アサーションが見当たらない"})
+    return out
+
+
+WEB_DEPS = re.compile(r'"(react|react-dom|vue|svelte|next|nuxt|@angular/core|vite|solid-js|preact|astro)"\s*:')
+
+
+def looks_like_web_app(project, files):
+    if "package.json" in files:
+        try:
+            with open(os.path.join(project, "package.json"), encoding="utf-8") as f:
+                if WEB_DEPS.search(f.read()):
+                    return True
+        except OSError:
+            pass
+    return any(f.endswith(("index.html", ".html")) and not f.startswith(("node_modules/", "dist/")) for f in files)

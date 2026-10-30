@@ -19,4 +19,22 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - name: エンジンと hook のテスト
-        run: python -m unittest discover -s tests -v
+        shell: bash
+        run: |
+          set -o pipefail
+          python -m unittest discover -s tests -v 2>&1 | tee test-output.txt
+      - name: 失敗したテストを注釈に出す
+        if: failure()
+        shell: bash
+        run: |
+          python - <<'PY'
+          import re
+          text = open("test-output.txt", encoding="utf-8", errors="replace").read()
+          blocks = re.split(r"\n={20,}\n", text)
+          for b in blocks[1:30]:
+              head = b.splitlines()[0] if b.strip() else ""
+              if not head.startswith(("FAIL:", "ERROR:")):
+                  continue
+              body = " | ".join(l.strip() for l in b.splitlines()[1:] if l.strip() and not l.startswith("---"))[-900:]
+              print(f"::error title={head[:120]}::{body}")
+          PY

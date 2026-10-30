@@ -11,6 +11,19 @@ description: AQ-DLCのrun終了時（フェーズ06）に、成功・失敗の�
 ## 言語
 Memoryの本文・見出し・タグ以外の記述、run.md への記録、ユーザーへの質問はすべて日本語で書く（tags と stack は検索用に英小文字でよい）。
 
+## エンジンが確かめること（量ではなく、証拠と再利用性）
+- run の最初に読む Memory は `memory --tags <タグ> --record` で記録する（上限 `max_loaded_per_run`）。
+- 読み込んだ Memory（参考を除く）ごとに、使った結果を `memory-use <ID> --result helped|not_applicable|harmful --note "<内容>"` で記録する。外れたもの・失敗したものも記録する（次の判断材料になる）。
+- `memory-done` には、保存・統合した ID と、保存しなかった理由を渡す:
+  `memory-done --saved F-0003 --merged W-0001 --skipped "<見送った候補と理由>"`（保存するものがなければ `--skipped` だけ）
+- エンジンは次を確かめ、満たさなければ完了にしない:
+  - 保存・統合した Memory が存在し、本文（evidence か applied_in）にこの run の ID がある
+  - 適用の記録が `promote_to_active_min_runs` 回未満のものを active にしていない（未検証の学びを確定的に扱わない）
+  - active なルールには、人間の承認（`approved_by: human`）がある
+  - 同じ題名・同じ ID の Memory が重複していない（統合する）
+  - 読み込んだ Memory の利用結果がすべて記録されている
+- Memory を無理に増やさない。証拠のない学び・一度きりの事情は保存せず、`--skipped` に理由を書く。
+
 ## 保存先
 - **global**（プロジェクトをまたぐ学び）：`~/.aq-dlc/memory/{failure,success,rules}/`
 - **project**（このプロジェクトだけの目的・技術・規約）：`<project>/.aq-dlc/memory/project/`
@@ -53,4 +66,4 @@ Memoryの本文・見出し・タグ以外の記述、run.md への記録、ユ�
 1回の質問にまとめ、**複数選択式**で聞く。各項目は1〜2行で、何を、なぜ、根拠を書く。0件なら聞かない。質問前に `ask` コマンドを実行し、返答後に `resume` を実行する。
 
 ## 6. 実行記録を閉じる
-run.md の「Memory」節に、保存・統合したid、SKIP候補、REVIEWの結果、Skill改善提案を書く。最後に `memory-done` コマンドを実行する。
+run.md の「Memory」節に、保存・統合したid、SKIP候補、REVIEWの結果、Skill改善提案を書く。最後に `memory-done --saved ... --merged ... --skipped "..."` を実行する（上の「エンジンが確かめること」）。

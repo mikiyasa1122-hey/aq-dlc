@@ -2,6 +2,9 @@
 # gate の生ログはコミットしない（結果は state.json に残る）
 .aq-dlc/runs/*/gate/
 .aq-dlc/runs/CURRENT
+.aq-dlc/runs/*/tmp/
+.aq-dlc/runs/*/actor.json
+.aq-dlc/runs/*/gate.lock
 
 # 生成物・依存関係
 __pycache__/
@@ -12,12 +15,12 @@ __pycache__/
 .venv/
 venv/
 node_modules/
-dist/
-build/
-target/
-coverage/
-.next/
-.turbo/
+/dist/
+/build/
+/target/
+/coverage/
+/.next/
+/.turbo/
 
 # OS / エディタ
 .DS_Store

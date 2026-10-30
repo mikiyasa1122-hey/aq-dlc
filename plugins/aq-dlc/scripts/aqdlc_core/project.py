@@ -37,9 +37,8 @@ DEFAULTS = {
     "gate": {
         "default_timeout_sec": 600,
         "env": {},
-        "ignore_dirs": [".git", ".aq-dlc", ".claude", "node_modules", ".venv", "venv",
-                        "__pycache__", "dist", "build", "target", ".next", ".turbo", ".vite",
-                        ".pytest_cache", ".mypy_cache", ".ruff_cache", "coverage", ".gradle",
+        # プロジェクト直下のビルド出力など（git で追跡しているファイルは除外しない）
+        "ignore_dirs": ["dist", "build", "target", ".next", ".turbo", ".vite", "coverage", "out",
                         "test-results", "playwright-report", "blob-report", ".nyc_output",
                         "htmlcov", ".cache", ".parcel-cache", ".svelte-kit"],
     },
@@ -51,6 +50,7 @@ DEFAULTS = {
         "force_foreground_agents": True,
         "max_agent_stop_blocks": 3,
         "max_auto_continues": 30,
+        "max_total_continues": 200,
         "max_fix_iterations": 8,
         "allow_github_ops": True,
         "block_force_push": True,
