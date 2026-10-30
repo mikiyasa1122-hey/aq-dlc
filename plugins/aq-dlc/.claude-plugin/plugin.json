@@ -1,7 +1,7 @@
 {
   "name": "aq-dlc",
   "displayName": "AQ-DLC",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "証拠で完了するマルチエージェント開発。統括と、要求分析・設計・実装・独立レビューのサブエージェントが、Failure First・Evidence Graph・Quality Gate・Memory で開発を進める。",
   "author": {
     "name": "AQ-DLC contributors"

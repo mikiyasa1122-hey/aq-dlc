@@ -116,7 +116,7 @@ def pending_fix(ctx):
 
 
 # ------------------------------------------------------------------ briefs
-def brief(role, ctx):
+def brief(role, ctx, entry=None):
     s, project, rd = ctx.state, ctx.project, ctx.rd
     aq = f'{engine_cmd()} <コマンド> --project "{project}"'
     head = [
@@ -132,6 +132,8 @@ def brief(role, ctx):
         "",
     ]
     body = globals()[f"_brief_{role}"](ctx)
+    if role == "reviewer" and entry:
+        body += _reviewer_extra(ctx, entry)
     return "\n".join(head + body)
 
 
@@ -266,6 +268,25 @@ def _brief_implementer(ctx):
     return lines
 
 
+def _reviewer_extra(ctx, entry):
+    lines = ["", "## エンジンが機械的に検出したテストの兆候（判断材料。合否はあなたが判断する）"]
+    sig = entry.get("test_signals") or []
+    if sig:
+        lines += [f"- {x['file']}: {x['issue']}" for x in sig]
+        lines.append("→ 各ファイルについて、問題かどうかと理由を報告に書く（ファイル名を必ず書く）。")
+    else:
+        lines.append("- なし（skip・.only・アサーションなしのテストファイルは見つからなかった）")
+    has_e2e = any(c.get("kind") == "e2e" for c in ctx.checks) or \
+        any(v.get("level") == "e2e" for _r, _p, v in iter_verifications(ctx.state))
+    lines += ["", "## E2E の要否"]
+    if entry.get("web_app") and not has_e2e:
+        lines.append("- Web アプリに見えるが、E2E のチェック・検証がない。重要な利用者の操作の流れについて E2E が必要かを評価し、"
+                     "不要ならその理由を「### E2E の要否」に書く。必要なら重大な指摘にする。")
+    else:
+        lines.append(f"- E2E は{'あり' if has_e2e else 'なし'}。リスクに見合っているかを「### E2E の要否」に書く。")
+    return lines
+
+
 def _brief_reviewer(ctx):
     s = ctx.state
     g = s.get("gate") or {}
@@ -314,11 +335,17 @@ def _brief_reviewer(ctx):
         "### 指摘",
         "- [重大1] 区分: 実装|テスト|仕様|設計 / 対象: R1, V3 / 内容: … / 根拠: ファイル:行 や 再現手順 / 提案: …",
         "- [軽微1] 区分: … / 対象: … / 内容: …",
+        "### 受け入れ条件ごとの検証の妥当性",
+        "- AC1: V1 は〜を確認しており妥当 / 〜のため不十分（受け入れ条件と重要な要求のリスクをすべて書く）",
+        "### E2E の要否",
+        "- 必要 / 不要（理由）",
         "### 不足しているリスク",
         "- R1: …（なければ「なし」）",
         "### 確認したこと",
         "- 実行したコマンドと結果",
         "```",
+        "「受け入れ条件ごとの検証の妥当性」では、テストが通ることではなく、そのテストが受け入れ条件・リスクを"
+        "本当に確かめているか（正常系だけでなく異常系・境界値、モックしすぎ、弱いアサーション）を評価する。",
         "「重大」の基準: 受け入れ条件の未達、重要な要求の検証不足・空洞化、設計との重大な不整合、重大なセキュリティの穴、"
         "テストの改ざん・弱体化。スタイルや好みは「軽微」。重大が1件でもあれば判定は「要修正」。",
     ]
@@ -602,14 +629,20 @@ def on_subagent_start(payload, project, state, spath):
     fresh, passing = gate_status(ctx)
     gate_ok = fresh and passing
     kind, items = pending_fix(ctx) if role == "implementer" else (None, [])
+    signals, web = [], False
+    if role == "reviewer":
+        files = sorted(ctx.snap)
+        signals = G.test_signals(project, files)
+        web = G.looks_like_web_app(project, files)
     entry = {"role": role, "since": now_iso(), "epoch": time.time(), "start_seq": state.get("seq", 0),
              "code_fp_start": ctx.code_fp, "gate_ok_at_start": gate_ok, "blocks": 0,
              "impl_hash_start": doc_hash(ctx.rd, "impl") if role == "implementer" else None,
-             "fix": {"kind": kind[0], "ref": kind[1], "labels": [f["label"] for f in items]} if kind else None}
+             "fix": {"kind": kind[0], "ref": kind[1], "labels": [f["label"] for f in items]} if kind else None,
+             "test_signals": signals, "web_app": web}
     state["agents"]["running"][aid] = entry
     state["stop_blocks"] = 0
     save_state(spath, state)
-    return {"hookSpecificOutput": {"hookEventName": "SubagentStart", "additionalContext": brief(role, ctx)}}
+    return {"hookSpecificOutput": {"hookEventName": "SubagentStart", "additionalContext": brief(role, ctx, entry)}}
 
 
 def on_subagent_stop(payload, project, state, spath):
@@ -649,10 +682,42 @@ def on_subagent_stop(payload, project, state, spath):
         summary = register(role, ctx, entry, message)
         ok = True
     state["agents"]["history"].append({"role": role, "agent_id": aid, "start": entry.get("since"),
-                                       "end": now_iso(), "ok": ok, "summary": summary})
+                                       "end": now_iso(), "sec": round(time.time() - entry.get("epoch", time.time()), 1),
+                                       "ok": ok, "summary": summary, "stop_blocks": entry.get("blocks", 0),
+                                       "tokens": transcript_usage(payload.get("agent_transcript_path"))})
     state["stop_blocks"] = 0
     save_state(spath, state)
     return None
+
+
+def transcript_usage(path):
+    """会話記録（JSONL）からトークン使用量を合計する（取得できなければ None）。"""
+    if not path or not os.path.exists(path):
+        return None
+    import json
+    seen, tot = set(), {"input": 0, "output": 0, "cache_read": 0, "cache_create": 0}
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for ln in f:
+                try:
+                    obj = json.loads(ln)
+                except ValueError:
+                    continue
+                msg = obj.get("message") or {}
+                u = msg.get("usage")
+                if not isinstance(u, dict):
+                    continue
+                key = msg.get("id") or obj.get("uuid")
+                if key in seen:
+                    continue
+                seen.add(key)
+                tot["input"] += int(u.get("input_tokens") or 0)
+                tot["output"] += int(u.get("output_tokens") or 0)
+                tot["cache_read"] += int(u.get("cache_read_input_tokens") or 0)
+                tot["cache_create"] += int(u.get("cache_creation_input_tokens") or 0)
+    except OSError:
+        return None
+    return tot if seen else None
 
 
 def _tainted(entry, ctx):
@@ -692,7 +757,8 @@ def deny(reason):
 
 # ------------------------------------------------------------------ permissions
 ENGINE_RE = re.compile(r"aqdlc\.py[\"']?\s+[\"']?([a-z][a-z-]*)")
-COMMON_READ = {"status", "next", "trace", "history", "show", "spec", "checks", "memory", "check", "escalation"}
+COMMON_READ = {"status", "next", "trace", "history", "show", "spec", "checks", "memory", "check", "escalation",
+               "metrics"}
 ROLE_COMMANDS = {
     "requirements": COMMON_READ | {"req", "accept", "risk", "verify", "assume", "question", "drop"},
     "design": COMMON_READ | {"design-map", "decision", "add-check", "remove-check", "bind"},

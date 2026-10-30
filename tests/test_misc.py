@@ -123,7 +123,7 @@ class CompletionTest(unittest.TestCase):
         e.start("reviewer")
         self.assertTrue(blocked(e.stop("reviewer", REVIEW_PASS)))  # 重要なリスク K2 の評価がない
         self.assertIsNone(e.stop("reviewer", REVIEW_PASS.replace("### E2E の要否", "- K2: V8 は公開後に人が確認（マージ後）\n### E2E の要否")))
-        e.aq("memory-done")
+        e.aq("memory-done", "--skipped", "テスト用の run のため保存する学びなし")
         out = e.aq("complete")
         self.assertIn("pr_ready", out)
         self.assertIsNone(e.hook("stop", {}))  # マージ待ちは止めない

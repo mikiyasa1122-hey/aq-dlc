@@ -7,6 +7,7 @@
 どれかが gate 実行時と変われば、その gate 結果は使えない。
 """
 import json
+import re
 import os
 import shutil
 import time
@@ -247,3 +248,50 @@ def print_ci(rec):
     info(f"CI（{rec['sha'][:7]}）: {label}")
     for r in rec["runs"]:
         print(f"  {r.get('name')}: {r.get('conclusion') or r.get('status')}  {r.get('url')}")
+
+
+# ------------------------------------------------------------------ テストの兆候（判断材料。合否は決めない）
+TEST_FILE = re.compile(r"(^|/)(tests?|__tests__|spec|specs|e2e)/|(_test|\.test|\.spec|Test|Tests)\.[A-Za-z]+$"
+                       r"|(^|/)test_[^/]+\.py$")
+SKIP_RE = re.compile(r"\.skip\s*\(|\bxit\s*\(|\bxdescribe\s*\(|\bxtest\s*\(|@(unittest\.)?skip|pytest\.mark\.(skip|xfail)"
+                     r"|\bt\.Skip\(|#\[ignore\]|@Disabled\b|@Ignore\b|\.todo\s*\(|\.fixme\s*\(")
+ONLY_RE = re.compile(r"\b(it|test|describe)\.only\s*\(|\bfit\s*\(|\bfdescribe\s*\(")
+ASSERT_RE = re.compile(r"assert|expect\s*\(|\.should\b|\.to(Be|Equal|Have|Contain|Match|Throw)|require\.|"
+                       r"\bt\.(Error|Fatal|Fail)|XCTAssert|check\s*\(|verify\s*\(", re.I)
+TEST_DEF_RE = re.compile(r"\bdef\s+test_|\b(it|test)\s*\(|\bfunc\s+Test|#\[test\]|@Test\b|\bfn\s+test_")
+CODE_EXT = (".py", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".go", ".rs", ".java", ".kt", ".swift", ".rb",
+            ".php", ".cs", ".vue", ".svelte")
+
+
+def test_signals(project, files):
+    """skip・.only・アサーションのないテストファイルを機械的に検出する（意味の判断はレビュー担当が行う）。"""
+    out = []
+    for rel in files:
+        if not rel.endswith(CODE_EXT) or not TEST_FILE.search(rel):
+            continue
+        try:
+            with open(os.path.join(project, rel), encoding="utf-8", errors="replace") as f:
+                text = f.read(400000)
+        except OSError:
+            continue
+        if SKIP_RE.search(text):
+            out.append({"file": rel, "issue": "skip / todo / xfail されたテストがある"})
+        if ONLY_RE.search(text):
+            out.append({"file": rel, "issue": ".only などで一部のテストだけを実行する指定がある"})
+        if TEST_DEF_RE.search(text) and not ASSERT_RE.search(text):
+            out.append({"file": rel, "issue": "テストの定義はあるが、アサーションが見当たらない"})
+    return out
+
+
+WEB_DEPS = re.compile(r'"(react|react-dom|vue|svelte|next|nuxt|@angular/core|vite|solid-js|preact|astro)"\s*:')
+
+
+def looks_like_web_app(project, files):
+    if "package.json" in files:
+        try:
+            with open(os.path.join(project, "package.json"), encoding="utf-8") as f:
+                if WEB_DEPS.search(f.read()):
+                    return True
+        except OSError:
+            pass
+    return any(f.endswith(("index.html", ".html")) and not f.startswith(("node_modules/", "dist/")) for f in files)

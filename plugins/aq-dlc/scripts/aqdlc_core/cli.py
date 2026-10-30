@@ -29,8 +29,10 @@ USAGE = """AQ-DLC エンジン
 実装:   bind <検証ID> [--command "..."] [--checks a,b] [--test "..."] [--level L] / impl-map <要求ID> --files a,b
 統括:   next / status / spec [--present | --approve "<人間の返答の要約>"] / answer <質問ID> "<回答>"
         ask "<質問>" / resume / wait "<理由>" / confirm <検証ID> "<人間の確認内容>" / escalation [<ID> --resolve "<対応>"]
-        gate [--after-merge] / ci [--wait 分] / memory [--tags a,b] / memory-done / complete / abort
-参照:   trace / history [--since N] / show <ID> / checks / check
+        gate [--after-merge] / ci [--wait 分] / complete / abort
+Memory: memory [--tags a,b] [--record] / memory-use <ID> --result helped|not_applicable|harmful
+        memory-done [--saved ID,..] [--merged ID,..] [--skipped "<理由>"]
+参照:   trace / history [--since N] / show <ID> / checks / check / metrics [--json]
 すべてのコマンドに --project <パス> を付けられる（省略時はカレントから探す）。"""
 
 
@@ -401,6 +403,7 @@ def cmd_answer(args):
 def cmd_ask(args):
     def fn(project, s, a):
         s.update(awaiting_human=True, question=" ".join(a), asked_seq=bump(s))
+        s["asks_total"] = int(s.get("asks_total", 0)) + 1
         info("人間への確認待ちとして記録しました（返答を得たら resume）。")
     mutate(args, fn)
 
@@ -548,14 +551,6 @@ def cmd_ci(args):
         sys.exit(1)
 
 
-def cmd_memory_done(args):
-    def fn(project, s, a):
-        s["memory_done"] = True
-        log(s, project, "memory-done", {})
-        info("Memory 整理を完了として記録しました。")
-    mutate(args, fn)
-
-
 def cmd_complete(args):
     project, s, spath = open_state(args)
     if running_agents(s):
@@ -575,8 +570,9 @@ def cmd_complete(args):
                 "\n→ マージ後: 既定ブランチを取り込み → gate --after-merge → 人の確認は ask でまとめて1回 → confirm → complete")
         return
     s["status"] = "complete"
+    s["metrics"] = collect_metrics(s)
     save_state(spath, s)
-    info("完了条件を満たしました。status を complete にしました。")
+    info("完了条件を満たしました。status を complete にしました。（運用の指標は metrics で確認）")
 
 
 def cmd_abort(args):
@@ -650,6 +646,72 @@ def cmd_show(args):
     print(json.dumps({"kind": kind, "parent": parent, **node}, ensure_ascii=False, indent=2))
 
 
+def _secs(a, b):
+    try:
+        return (_dt.datetime.fromisoformat(b) - _dt.datetime.fromisoformat(a)).total_seconds()
+    except (TypeError, ValueError):
+        return 0
+
+
+def collect_metrics(s):
+    hist = s["agents"].get("history", [])
+    roles = {}
+    for h in hist:
+        r = roles.setdefault(h["role"], {"runs": 0, "sec": 0.0, "ok": 0, "stop_blocks": 0, "tokens": None})
+        r["runs"] += 1
+        r["ok"] += 1 if h.get("ok") else 0
+        r["sec"] += h.get("sec") or _secs(h.get("start"), h.get("end"))
+        r["stop_blocks"] += h.get("stop_blocks", 0)
+        if h.get("tokens"):
+            t = r["tokens"] or {"input": 0, "output": 0, "cache_read": 0, "cache_create": 0}
+            for k in t:
+                t[k] += h["tokens"].get(k, 0)
+            r["tokens"] = t
+    gh = s.get("gate_history", [])
+    reviews = s.get("reviews", [])
+    end = s.get("closed_at") or now_iso()
+    return {
+        "run_sec": round(_secs(s.get("created"), end)),
+        "roles": roles,
+        "gate": {"runs": len(gh), "failed": sum(1 for g in gh if not g.get("pass")),
+                 "modified_during": sum(1 for g in gh if g.get("modified")),
+                 "sec": round(sum(g.get("sec") or 0 for g in gh), 1)},
+        "reviews": {"runs": len(reviews), "passed": sum(1 for r in reviews if r.get("passed")),
+                    "needs_fix": sum(1 for r in reviews if r.get("valid") and not r.get("passed")),
+                    "invalid": sum(1 for r in reviews if not r.get("valid"))},
+        "fix_iterations": s.get("fix_iterations", 0),
+        "human": {"replies": len(s.get("human_events", [])), "asks": s.get("asks_total", 0)},
+        "stop_blocks_total": s.get("stop_blocks_total", 0),
+        "violations": len(s.get("violations", [])),
+        "orchestrator_tokens": A.transcript_usage(s.get("session_transcript")),
+    }
+
+
+def cmd_metrics(args):
+    as_json = pop_flag(args, "--json")
+    project, s, _ = open_state(args)
+    m = collect_metrics(s)
+    if as_json:
+        print(json.dumps(m, ensure_ascii=False, indent=2))
+        return
+
+    def tok(t):
+        return "取得できず" if not t else f"入力 {t['input']:,} / 出力 {t['output']:,} / キャッシュ読込 {t['cache_read']:,}"
+    print(f"run 全体の経過時間: {m['run_sec'] // 60} 分 {m['run_sec'] % 60} 秒")
+    print("| 担当 | 実行回数 | 再実行 | 所要時間 | 終了の差し戻し | トークン |\n|---|---|---|---|---|---|")
+    for role, r in m["roles"].items():
+        print(f"| {ROLE_LABEL.get(role, role)} | {r['runs']} | {max(0, r['runs'] - 1)} | {round(r['sec'])} 秒 | "
+              f"{r['stop_blocks']} | {tok(r['tokens'])} |")
+    g = m["gate"]
+    print(f"Quality Gate: {g['runs']} 回（不合格 {g['failed']} 回、うち実行中の変更 {g['modified_during']} 回、計 {g['sec']} 秒）")
+    rv = m["reviews"]
+    print(f"独立レビュー: {rv['runs']} 回（合格 {rv['passed']}・要修正 {rv['needs_fix']}・無効 {rv['invalid']}）"
+          f"  修正ループ: {m['fix_iterations']} 回")
+    print(f"人間の介入: 返答 {m['human']['replies']} 回・確認依頼 {m['human']['asks']} 回  "
+          f"Stop hook による継続: {m['stop_blocks_total']} 回  担当外の変更: {m['violations']} 件")
+    print(f"統括のトークン: {tok(m['orchestrator_tokens'])}")
+
+
 def cmd_doctor(args):
     project = resolve_project(args, required=False) or os.getcwd()
     ok = True
@@ -705,6 +767,10 @@ def hook_context(payload):
     cwd = payload.get("cwd") or os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
     project = active_project_for(cwd)
     state, spath = (load_state(project) if project else (None, None))
+    tp = payload.get("transcript_path")
+    if state and tp and not payload.get("agent_type") and state.get("session_transcript") != tp:
+        state["session_transcript"] = tp  # 統括の会話記録（トークンの集計に使う）
+        save_state(spath, state)
     return cwd, project, state, spath
 
 
@@ -734,6 +800,15 @@ def hook_pre_bash(payload):
             and cfg["automation"].get("enforce_roles", True):
         rd = run_dir(project, state.get("run_id"))
         if rd:
+            tmpd = os.path.join(rd, "tmp")
+            if os.path.isdir(tmpd):  # 対応する PostToolUse が来なかった古い記録を掃除する
+                for f in os.listdir(tmpd):
+                    fp = os.path.join(tmpd, f)
+                    try:
+                        if time.time() - os.path.getmtime(fp) > 3600:
+                            os.remove(fp)
+                    except OSError:
+                        pass
             prev = (state.get("gate") or {}).get("snapshot")
             save_json(A.bash_snapshot_path(rd, payload.get("tool_use_id")),
                       {"role": role, "cmd": cmd[:2000], "snapshot": G.snapshot(project, cfg, prev)})
@@ -865,6 +940,7 @@ def hook_stop(payload):
         return None
     phase, nxt, _probs = next_action(ctx)
     state["stop_blocks"] = state.get("stop_blocks", 0) + 1
+    state["stop_blocks_total"] = int(state.get("stop_blocks_total", 0)) + 1
     save_state(spath, state)
     reason = (f"AQ-DLC: run が進行中です（{project} / フェーズ: {phase}）。\n次: {nxt}\n"
               "人間の判断が必要なら ask を実行してから質問してください。中断するなら abort。\n"
@@ -952,9 +1028,9 @@ COMMANDS = {
     "bind": cmd_bind, "impl-map": cmd_impl_map,
     "spec": cmd_spec, "answer": cmd_answer, "ask": cmd_ask, "resume": cmd_resume, "wait": cmd_wait,
     "confirm": cmd_confirm, "escalation": cmd_escalation, "gate": cmd_gate, "ci": cmd_ci,
-    "memory": memory.cmd_memory, "memory-done": cmd_memory_done, "complete": cmd_complete, "abort": cmd_abort,
+    "memory": memory.cmd_memory, "memory-done": memory.cmd_memory_done, "memory-use": memory.cmd_memory_use, "complete": cmd_complete, "abort": cmd_abort,
     "next": cmd_next, "status": cmd_status, "check": cmd_check, "trace": cmd_trace, "history": cmd_history,
-    "show": cmd_show,
+    "show": cmd_show, "metrics": cmd_metrics,
 }
 REMOVED = {"review": "レビュー結果は aq-dlc:reviewer の終了時にエンジンが自動で記録します（手動では記録できません）。",
            "phase": "フェーズは状態から自動で決まります（next で確認）。",

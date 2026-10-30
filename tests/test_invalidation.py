@@ -13,7 +13,7 @@ def finish_review(e):
     e.spawn("reviewer")
     e.start("reviewer")
     assert e.stop("reviewer", REVIEW_PASS) is None
-    e.aq("memory-done")
+    e.aq("memory-done", "--skipped", "テスト用の run のため保存する学びなし")
 
 
 class InvalidationTest(unittest.TestCase):

@@ -68,7 +68,7 @@ class WorkflowTest(unittest.TestCase):
         e.start("reviewer")
         self.assertIsNone(e.stop("reviewer", REVIEW_PASS))
         self.assertIn("Memory", e.next())
-        e.aq("memory-done")
+        e.aq("memory-done", "--skipped", "テスト用の run のため保存する学びなし")
         out = e.aq("complete")
         self.assertIn("complete", out)
         self.assertIsNone(e.hook("stop", {}))

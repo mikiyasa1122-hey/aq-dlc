@@ -108,6 +108,18 @@
           }
         ]
       }
+    ],
+    "PostToolUseFailure": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/aqdlc.py\" hook post-bash",
+            "timeout": 60
+          }
+        ]
+      }
     ]
   }
 }
