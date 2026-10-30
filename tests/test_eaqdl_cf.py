@@ -33,6 +33,11 @@ class TestOperators(unittest.TestCase):
         self.assertIsNone(self.ap("eq_flip", 'msg = "a == b"\n'))  # 文字列の中は変えない
         self.assertIsNone(self.ap("negate_if", "# if x:\n"))  # コメント
         self.assertIsNone(self.ap("boundary", "def f(x) -> int:\n"))
+        # コメント・docstring は変えない（レビュー指摘）
+        self.assertIsNone(self.ap("and_or", "x = 1  # a and b\n"))
+        self.assertIsNone(self.ap("negate_if", 'def f():\n    """\n    if the user is admin:\n    """\n', 2))
+        self.assertIsNone(self.ap("eq_flip", "let a = 1; // a == b\n", lang="js"))
+        self.assertIsNone(self.ap("sql_where", "// UPDATE t SET x=1 WHERE a = 1 AND b = 2\n", lang="js"))
 
     def test_js_operators(self):
         js = "  if (!user || user.role !== 'admin') { throw new Error('forbidden'); }\n"
@@ -57,6 +62,12 @@ class TestOperators(unittest.TestCase):
         self.assertEqual(CF.classify(124, "タイムアウト", True)[0], "timeout")
         self.assertEqual(CF.classify(2, "ERROR: tests/x.py\nImportError while importing test module", False)[0],
                          "invalid")
+        # 環境の障害・収集エラー・変換エラーは検出とは扱わない（レビュー指摘）
+        for out in ("Error: connect ECONNREFUSED 127.0.0.1:5432", "ERROR collecting tests/test_x.py",
+                    "Transform failed with 1 error: ERROR: Unexpected", "Traceback (most recent call last):\nKeyError"):
+            self.assertEqual(CF.classify(1, out, False)[0], "invalid", out)
+        self.assertEqual(CF.classify(1, " Tests  1 failed | 3 passed (4)", False)[0], "killed")
+        self.assertEqual(CF.classify(1, "=== 1 failed, 2 passed in 0.12s ===", False)[0], "killed")
 
     def test_secret_env_is_not_passed(self):
         os.environ["GITHUB_TOKEN"] = "ghp_dummy_value_for_test_123456"
@@ -211,7 +222,7 @@ class TestCounterfactualGate(unittest.TestCase):
             if v["id"] == "V1":
                 v["command"] = f'{PY} -c "import sys; sys.exit(1)"'  # 隔離環境で最初から失敗
             else:
-                v["command"] = (f'{PY} -c "import time; t=open(\'src/memo.py\').read(); '
+                v["command"] = (f'{PY} -c "import time; t=open(\'src/memo.py\', encoding=\'utf-8\').read(); '
                                 f'time.sleep(20 if (\'False\' in t or \'pass\' in t or \'not (\' in t) else 0)"')
         muts, _ = CF.plan(e.project, s, cfg)
         rec = CF.execute(e.project, s, cfg, muts, os.path.join(e.tmp, "cflog"), "t1")

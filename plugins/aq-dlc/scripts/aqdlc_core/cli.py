@@ -71,7 +71,12 @@ KIND_ALIASES = {"機能": "functional", "非機能": "nonfunctional", "functiona
 def cmd_new(args):
     force = pop_flag(args, "--force")
     project = resolve_project(args)
-    cur, _ = load_state(project)
+    try:
+        cur, _ = load_state(project)
+    except StateError as e:
+        if not force:
+            die(str(e))
+        cur = None
     if cur and cur.get("status") in ("in_progress", "pr_ready") and not force:
         die(f"進行中の run があります: {cur['run_id']}（{cur.get('status')}）。complete か abort をしてから始めるか、"
             "--force を付けてください（進行中の run はそのまま残ります）。")
@@ -461,11 +466,12 @@ def cmd_confirm(args):
             die(f"{a[0]} は自動の検証です。gate で確かめてください。")
         if not s.get("asked_seq") or last_human_seq(s) <= s["asked_seq"]:
             die("ask の後に人間の返答が記録されていません。ask を実行して人間に確認してから記録してください。")
-        decision, ev, _f = AP.find_decision(s, a[0], s["asked_seq"])
+        target = f"VERIFY-{a[0]}"
+        decision, ev, _f = AP.find_decision(s, target, s["asked_seq"])
         if decision != "approve":
-            die(f"ask の後の人間の返答に、{a[0]} への明示的な確認（「承認 {a[0]}」）がありません"
+            die(f"ask の後の人間の返答に、{a[0]} への明示的な確認（「承認 {target}」）がありません"
                 + ("（却下の返答があります）" if decision == "reject" else "") + "。")
-        AP.record(s, a[0], "approve", ev, run_dir(project, s.get("run_id")), " ".join(a[1:]), "confirm")
+        AP.record(s, target, "approve", ev, run_dir(project, s.get("run_id")), " ".join(a[1:]), "confirm")
         v.update(confirmed_by="human", confirm_note=" ".join(a[1:]), confirmed_seq=bump(s))
         log(s, project, "confirm", {"id": a[0], "note": v["confirm_note"]})
         info(f"人間の確認として記録しました: {a[0]}")
@@ -644,6 +650,9 @@ def cmd_cf(args):
     s, spath = load_state(project)
     ctx2 = Ctx(project, s, cfg)
     rec["notes"] = notes + rec.get("notes", [])
+    full, _n = CF.plan(project, s, cfg, source=list(ctx.snap), limit=10 ** 6)
+    planned = {m["verification"] for m in muts}
+    rec["unrun"] = sorted({m["verification"] for m in full} - planned)
     rec.update({"seq": bump(s), "checks_fp": ctx2.checks_fp, "graph_fp": ctx2.graph_fp,
                 "def_fp": CF.definition_fp(s, cfg, muts), "env_fp": CF.env_fp(cfg), "partial": bool(only)})
     if only:
@@ -694,6 +703,8 @@ def cmd_cf_add(args):
             die("対応している言語は Python と JavaScript / TypeScript です")
         with open(path, encoding="utf-8", newline="") as f:
             lines = f.read().splitlines(keepends=True)
+        if not str(line).isdigit() or int(line) < 1:
+            die("--line は 1 以上の整数で指定してください")
         n = int(line)
         if MU.apply(op, lines, n - 1, MU.language(r)) is None:
             die(f"{r}:{n} に {op} を適用できません（形式的な適用の検査で不可）")
@@ -1057,9 +1068,24 @@ def cmd_metrics(args):
 
 
 def cmd_audit(args):
-    """audit [--verify] [--limit N] — 承認・同意・共有の決定、hook の異常、状態の保存拒否の監査ログ"""
+    """audit [--verify] [--limit N] — 承認・同意・共有の決定、hook の異常、偽装の疑いの解決（--resolve FORGED-n）、状態の保存拒否の監査ログ"""
     verify = pop_flag(args, "--verify")
+    resolve = pop_opt(args, "--resolve")
     limit = int(pop_opt(args, "--limit") or 30)
+    if resolve:
+        def fn(project, s, a):
+            f = next((x for x in s.get("forged_events", []) if x["id"] == resolve), None)
+            if not f:
+                die(f"{resolve} が見つかりません。")
+            if not s.get("asked_seq"):
+                die(f"ask で人間に状況を報告し、「承認 {resolve}」の返答を得てから実行してください。")
+            decision, ev, _f = AP.find_decision(s, resolve, s["asked_seq"])
+            if decision != "approve":
+                die(f"ask の後の人間の返答に「承認 {resolve}」がありません。")
+            AP.record(s, resolve, "approve", ev, run_dir(project, s.get("run_id")), "偽装の疑いを人間が確認", "forged")
+            f.update(resolved=True, resolved_at=now_iso())
+            info(f"{resolve} を人間の確認済みにしました。取り消された承認は取り直してください。")
+        return mutate(args, fn)
     from .project import home
     project = resolve_project(args, required=False)
     paths = []
@@ -1203,6 +1229,10 @@ def hook_pre_bash(payload):
     why = A.check_bash(role, cmd, project, state, cfg)
     if why:
         return A.deny(why)
+    if state:
+        # すべての担当の Bash について、実行前の seq を記録する（実行中に「人間の返答」が増えたら偽装として扱う）
+        save_json(A.bash_human_path(project, payload.get("tool_use_id")),
+                  {"seq": int(state.get("seq", 0)), "run": state.get("run_id"), "role": role, "cmd": cmd[:500]})
     # 実装担当以外の Bash は、実行前のコードと設定の状態をプロジェクトの外に記録し、実行後に比べる。
     # run がない間も「記録した」こと自体は残す（実行後に記録が消えていたら改ざんとして扱うため）。
     if role != "implementer":
@@ -1239,11 +1269,20 @@ def hook_post_bash(payload):
     リダイレクト・スクリプト・変数展開などの書き方に関係なく、実行前後のファイル内容で判定する。
     """
     role = A.role_of(payload.get("agent_type"))
-    if role == "implementer":
-        return None
     cwd, project, state, spath = hook_context(payload)
     if not project:
         return None
+    forged = _check_forged_human(project, payload)
+    if role == "implementer":
+        return forged
+    res = _post_bash_changes(payload, role, project, state)
+    if forged and res:
+        forged["reason"] += "\n" + res["reason"]
+        forged["hookSpecificOutput"]["additionalContext"] = forged["reason"]
+    return forged or res
+
+
+def _post_bash_changes(payload, role, project, state):
     snap_path = A.bash_snapshot_path(project, payload.get("tool_use_id"))
     pre = load_json(snap_path, None)
     active = bool(state and state.get("status") in ("in_progress", "pr_ready"))
@@ -1305,6 +1344,60 @@ def hook_post_bash(payload):
               "済むまで、レビュー・完了に進めません。")
     if v["kind"] == "git":
         reason += "（git の操作による作業ツリーの変化も、取り込みの確認が必要です）"
+    return {"decision": "block", "reason": reason,
+            "hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": reason}}
+
+
+def _check_forged_human(project, payload):
+    """Bash の実行中に記録された「人間の返答」は、hook を直接呼んだ偽装として無効にする。
+
+    人間の発言（UserPromptSubmit）と AskUserQuestion の回答は、Bash の実行中には届かない。実行中に増えた
+    返答は、承認の判定に使わないようにし、それに基づく承認を取り消す。
+    """
+    path = A.bash_human_path(project, payload.get("tool_use_id"))
+    pre = load_json(path, None)
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+    if not pre:
+        return None
+    state, spath = load_state(project)
+    if not state or state.get("run_id") != pre.get("run"):
+        return None
+    bad = [e for e in state.get("human_events", []) if e.get("seq", 0) > pre["seq"] and e.get("kind") != "forged"]
+    if not bad:
+        return None
+    seqs = {e["seq"] for e in bad}
+    for e in bad:
+        e.update(kind="forged", parsed=False)
+    revoked = set()
+    for a in list(state.get("approvals", [])):
+        if a.get("event_seq") in seqs and a.get("decision") == "approve":
+            state["approvals"].append(dict(a, decision="revoked", at=now_iso(), note="Bash の実行中に記録された返答による承認"))
+            revoked.add(a["target"])
+    sp = state.get("spec") or {}
+    if sp.get("approval_target") in revoked:
+        for k in ("approved_hash", "approved_seq", "approved_at", "approval_target"):
+            sp.pop(k, None)
+    ms = state.get("memory_scope") or {}
+    if ms.get("event_seq") in seqs or (ms.get("seq", 0) > pre["seq"] and ms.get("source") in ("approval", "user_reply")):
+        state.pop("memory_scope", None)
+    from .state import iter_verifications as _iv
+    for _r, _p, v in _iv(state):
+        if v.get("confirmed_by") == "human" and f"VERIFY-{v['id']}" in revoked:
+            for k in ("confirmed_by", "confirm_note", "confirmed_seq"):
+                v.pop(k, None)
+    fid = f"FORGED-{bump(state)}"
+    state.setdefault("forged_events", []).append({"id": fid, "seqs": sorted(seqs), "role": pre.get("role"),
+                                                  "cmd": pre.get("cmd"), "at": now_iso(), "revoked": sorted(revoked),
+                                                  "resolved": False})
+    save_state(spath, state)
+    rd = run_dir(project, state.get("run_id"))
+    AP.audit_append(os.path.join(rd, "audit.jsonl"), "human.forged", id=fid, seqs=sorted(seqs),
+                    revoked=sorted(revoked), cmd=pre.get("cmd"))
+    reason = (f"E-AQDL: Bash の実行中に「人間の返答」が記録されました（{fid}）。hook を直接呼んだ偽装として無効にし、"
+              f"それに基づく承認（{', '.join(sorted(revoked)) or 'なし'}）を取り消しました。人間に状況を報告してください。")
     return {"decision": "block", "reason": reason,
             "hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": reason}}
 
@@ -1473,7 +1566,7 @@ def _hook_project(payload):
     cwd = (payload or {}).get("cwd") or os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
     try:
         return active_project_for(cwd) or find_project(cwd)
-    except Exception:  # noqa: BLE001
+    except (Exception, SystemExit):  # noqa: BLE001
         return None
 
 
@@ -1494,9 +1587,9 @@ def run_hook(name):
         if name in FAIL_CLOSED and _hook_project({}):
             emit(A.deny("hook の入力を読めなかったため、安全のため止めました。もう一度実行してください。"))
         return
-    if name != "pre-bash":
-        cwd = payload.get("cwd") or os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
-        if A.forged_hook(active_project_for(cwd), name):
+    if name not in FAIL_CLOSED and name != "post-bash":
+        # 重要な PreToolUse は偽装の判定をしない（偽装しても許可されることはないため、常に通常の判定をする）
+        if A.forged_hook(_hook_project(payload), name):
             print("[E-AQDL] Bash から hook を直接呼ぶことはできません。", file=sys.stderr)
             return
     try:

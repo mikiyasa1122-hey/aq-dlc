@@ -12,7 +12,7 @@
 安全のための方針:
   - 元の作業ツリーは変更しない。プロジェクトの外（~/.aq-dlc/tmp/cf/）に作った一時コピーで実行し、
     終了時（異常終了・中断を含む）に削除する。前回の残りは次回の開始時に掃除する。
-  - 実行するのは、人間が承認した設定に登録済みの検証コマンド（V の command / checks）だけ。
+  - 実行するのは、登録済みの検証コマンド（V の command・checks。履歴に残り、独立レビューで確認される）だけ。
     Mutation は1行の決定論的な書き換えで、任意のコマンドや LLM の生成したパッチは実行しない。
   - 子プロセスには資格情報らしい環境変数を渡さない。HTTP(S) のプロキシを使えないアドレスに向け、
     外部への通信を原則として失敗させる（OS のサンドボックスではないため、完全な遮断は保証しない）。
@@ -33,21 +33,24 @@ RESULTS = ("killed", "survived", "invalid", "timeout", "not_applicable")
 DEFAULTS = {"mode": "off", "timeout_sec": 300, "max_mutations": 12, "per_verification": 2,
             "auto_plan": True, "copy_extra": []}
 SECRET_ENV = re.compile(r"(TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|API_?KEY|PRIVATE|AUTH|SESSION|COOKIE|"
-                        r"DATABASE_URL|DB_URL|CONN(ECTION)?_STR)", re.I)
+                        r"DATABASE_URL|DB_URL|CONN(ECTION)?_STR|_URL$|_URI$|_DSN$|_HOST$|ENDPOINT)", re.I)
 SECRET_PREFIX = ("AWS_", "GH_", "GITHUB_", "AZURE_", "GOOGLE_", "GCP_", "GCLOUD_", "OPENAI", "ANTHROPIC",
                  "NPM_TOKEN", "HEROKU_", "VERCEL_", "NETLIFY_", "STRIPE_", "SLACK_", "TWILIO_", "SENTRY_")
 LINK_DIRS = ("node_modules", ".venv", "venv")
 # テストの起動失敗・環境の問題（欠陥の検出ではない）
 INVALID_OUT = re.compile(
+    r"error during collection|ERROR collecting|Interrupted: \d+ error|ECONNREFUSED|EADDRINUSE|EACCES|ETIMEDOUT|"
+    r"Transform failed|Cannot use import statement|Unexpected token|Failed to load|"
     r"SyntaxError|IndentationError|TabError|Cannot find module|ERR_MODULE_NOT_FOUND|ModuleNotFoundError|"
     r"No module named|error TS\d{3,5}|command not found|is not recognized as an internal or external command|"
     r"collected 0 items|no tests ran|No tests found|No test files found|ERROR: file or directory not found|"
     r"Ran 0 tests|ImportError while importing test module|Failed to import test module|unittest\.loader\._FailedTest|"
     r"ENOENT", re.I)
-# テストの失敗（期待値の違反・テスト中の例外）
+# テストランナーが報告したテストの失敗（期待値の違反、またはテスト中の例外）
 FAIL_OUT = re.compile(
-    r"AssertionError|assert(ion)?\s|FAILED|FAIL\b|\bfailed\b|failures=|errors=|not ok\b|✗|✕|×|Expected|"
-    r"expect\(|toBe|toEqual|toThrow|Traceback|Error:", re.I)
+    r"AssertionError|FAILED \((failures|errors)=\d+|=+ .*\b\d+ failed\b|\b\d+ failed\b.*\bin [\d.]+s|"
+    r"Tests?:?\s+\d+ failed|Test Files\s+\d+ failed|\b\d+ failing\b|^not ok \d+|^# fail [1-9]|"
+    r"AssertionError \[ERR_ASSERTION\]|expect\(received\)|Expected:|✗|✕", re.M)
 
 
 def cf_config(cfg):
@@ -101,7 +104,7 @@ def _read_lines(project, rel):
         return None
 
 
-def plan(project, state, cfg, source=None):
+def plan(project, state, cfg, source=None, limit=None):
     """反証テストの計画。戻り値: (mutations, notes)。
 
     mutations: [{id, verification, parent, requirement, risk, operator, category, file, line, original,
@@ -171,8 +174,11 @@ def plan(project, state, cfg, source=None):
                             break
                     if done:
                         break
-    limit = int(cc["max_mutations"])
+    limit = int(cc["max_mutations"]) if limit is None else limit
     if len(muts) > limit:
+        cut = {m["verification"] for m in muts[limit:]} - {m["verification"] for m in muts[:limit]}
+        if cut:
+            notes.append("上限のため反証テストを行わない検証: " + ", ".join(sorted(cut)))
         notes.append(f"Mutation の数が上限（{limit}）を超えたため、{len(muts) - limit} 件を実行しない")
         muts = muts[:limit]
     for n, m in enumerate(muts, 1):
@@ -382,14 +388,40 @@ def run_commands(cmds, cwd, timeout, env):
 
 
 def run_cmd_env(cmd, cwd, timeout, env):
+    """コマンドを実行する。時間切れのときは、子だけでなく孫のプロセスまで止める。"""
     import subprocess
     from .util import decode
     start = time.time()
+    kw = {}
+    if os.name == "nt":
+        kw["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    else:
+        kw["start_new_session"] = True
+    p = subprocess.Popen(cmd, shell=True, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, **kw)
     try:
-        p = subprocess.run(cmd, shell=True, cwd=cwd, capture_output=True, timeout=timeout, env=env)
-        return p.returncode, decode(p.stdout) + decode(p.stderr), round(time.time() - start, 2)
+        out, _ = p.communicate(timeout=timeout)
+        return p.returncode, decode(out), round(time.time() - start, 2)
     except subprocess.TimeoutExpired:
+        _kill_tree(p)
+        try:
+            p.communicate(timeout=10)
+        except (subprocess.TimeoutExpired, OSError, ValueError):
+            pass
         return 124, f"タイムアウト（{timeout}秒）", round(time.time() - start, 2)
+
+
+def _kill_tree(p):
+    import subprocess
+    try:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/T", "/F", "/PID", str(p.pid)], capture_output=True, timeout=20)
+        else:
+            os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+    except (OSError, subprocess.SubprocessError, ProcessLookupError):
+        try:
+            p.kill()
+        except OSError:
+            pass
 
 
 def classify(code, out, timed_out):
@@ -633,4 +665,6 @@ def critical_gaps(state, rec):
         elif ms and not any(m.get("result") == "killed" for m in ms) \
                 and not all(m.get("result") == "not_applicable" for m in ms):
             gaps.append((v["id"], "反証テストが成立しなかった（invalid / timeout のみ）", []))
+        elif not ms and v["id"] in (rec or {}).get("unrun", []):
+            gaps.append((v["id"], "Mutation の上限のため反証テストを行っていない", []))
     return gaps

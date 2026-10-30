@@ -128,7 +128,16 @@ class MemoryReliabilityTest(unittest.TestCase):
         out = self.e.aq("memory-done", "--end", "project", "--saved", "W-0104", ok=False)
         self.assertIn("統合", out)
 
+    def use_common(self):
+        """読み込みの検査は共通 Memory で行う（プロジェクトの Memory は根拠を照合できないと未検証として扱うため）。"""
+        self.mem_dir = os.path.join(self.e.home, "memory", "success")
+        os.makedirs(self.mem_dir, exist_ok=True)
+        s = self.e.state()
+        s["memory_scope"] = {"choice": "all", "source": "config", "seq": s["seq"]}
+        self.e.save_state(s)
+
     def test_loaded_memory_needs_a_result(self):
+        self.use_common()
         self.write_mem("W-0105", status="validated")
         out = self.e.aq("memory", "--tags", "workflow", "--record")
         self.assertIn("W-0105", out)
@@ -141,6 +150,7 @@ class MemoryReliabilityTest(unittest.TestCase):
         self.assertEqual(self.e.state()["memory"]["used"]["W-0105"]["result"], "helped")
 
     def test_listing_respects_limit(self):
+        self.use_common()
         for i in range(30):
             self.write_mem(f"W-02{i:02d}", status="validated")
         out = self.e.aq("memory", "--tags", "workflow")

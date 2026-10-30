@@ -35,6 +35,15 @@ def gate_global_stale(ctx):
         out.append("設定の変更")
     if g.get("modified_during_gate"):
         out.append("gate の実行中の変更")
+    st = ctx.state
+    sp = st.get("spec") or {}
+    li = ((st.get("impl") or {}).get("rounds") or [None])[-1]
+    if sp.get("approved_hash") and sp["approved_hash"] != ctx.spec_hash:
+        out.append("承認後の仕様の変更")
+    elif li and li.get("spec_hash") and li["spec_hash"] != ctx.spec_hash:
+        out.append("実装後の仕様の変更")
+    if li and li.get("design_hash") and li["design_hash"] != ctx.design_hash:
+        out.append("実装後の設計の変更")
     return out
 
 
@@ -45,7 +54,10 @@ def compute(ctx):
     gstale = gate_global_stale(ctx)
     cc = CF.cf_config(cfg)
     crec = CF.current(s)
-    cstale = CF.stale_reasons(ctx, crec) if (crec and cc["mode"] != "off") else []
+    incomplete = bool(crec) and crec.get("status") != "done" and cc["mode"] != "off"
+    cstale = [x for x in CF.stale_reasons(ctx, crec) if x not in ("中断された", "実行中に作業ツリーが変わった",
+                                                                   "完了していない")] \
+        if (crec and cc["mode"] != "off") else []
     bv = CF.by_verification(crec) if crec else {}
     rv = current_review(s)
     review = "未実施"
@@ -80,10 +92,12 @@ def compute(ctx):
             layer_c = "対象外"
         elif not crec:
             layer_c = "未実行"
+        elif incomplete:
+            layer_c = f"未完了（{crec.get('status')}）"
         elif cstale:
             layer_c = "失効"
         elif not ms:
-            layer_c = "対象外" if crec else "未実行"
+            layer_c = "未実施（Mutation の上限）" if v["id"] in crec.get("unrun", []) else "対象外"
         else:
             kinds = [m["result"] for m in ms]
             if "survived" in kinds:
@@ -107,7 +121,7 @@ def compute(ctx):
             basis.append(f"通常 Gate: {layer_g}")
         elif causes:
             state = "invalidated"
-        elif layer_c.startswith("見逃し") or layer_c.startswith("不成立"):
+        elif layer_c.startswith("見逃し") or layer_c.startswith("不成立") or layer_c.startswith("未実施"):
             state = "insufficient"
             basis.append(f"反証テスト: {layer_c}")
         elif layer_c.startswith("検出"):

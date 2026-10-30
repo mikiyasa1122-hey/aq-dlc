@@ -178,25 +178,38 @@ class TestLifecycle(unittest.TestCase):
         p = write_mem(self.proj, "W-0720", status="active", evidence=f"x/runs/{self.run_id}#V1")
         out = self.done("--end", "project", "--saved", "W-0720", ok=False)
         self.assertIn("役立った記録", out)
-        # 台帳に、別の run で役立った記録が 2 件ある
         from aqdlc_core import memory as M
         os.environ["AQDLC_HOME"] = self.e.home
         key = M.project_key(self.e.project)
         led = os.path.join(self.proj, "ledger.jsonl")
-        with open(led, "a", encoding="utf-8") as f:
-            for r in ("20990101-000001-a", "20990101-000002-b"):
-                f.write(json.dumps({"kind": "use", "memory": "W-0720", "run": r, "project": key,
-                                    "result": "helped"}) + "\n")
-            # 同じ run の重複は 1 回として数える
-            f.write(json.dumps({"kind": "use", "memory": "W-0720", "run": "20990101-000002-b", "project": key,
-                                "result": "helped"}) + "\n")
+
+        def ledger_line(run, result):
+            with open(led, "a", encoding="utf-8") as f:
+                f.write(json.dumps({"kind": "use", "memory": "W-0720", "run": run, "project": key,
+                                    "result": result}) + "\n")
+        # 台帳だけを書き足した（実在しない run の）記録は数えない（レビュー指摘: 自己申告での昇格を防ぐ）
+        ledger_line("20990101-000001-fake", "helped")
+        ledger_line("20990101-000002-fake", "helped")
+        self.assertIn("役立った記録", self.done("--end", "project", "--saved", "W-0720", ok=False))
+
+        # 実在する run の state に、読み込み・利用結果・gate 合格の記録がある場合だけ数える
+        def fake_run(run, result, gate="合格", loaded=True):
+            d = os.path.join(self.e.project, ".aq-dlc", "runs", run)
+            os.makedirs(d, exist_ok=True)
+            st = {"run_id": run, "memory": {"loaded": {"W-0720": {}} if loaded else {},
+                                            "used": {"W-0720": {"result": result, "gate": gate}}}}
+            write_file(os.path.join(d, "state.json"), json.dumps(st))
+            ledger_line(run, result)
+        fake_run("20990101-000003-a", "helped", gate="不合格")  # gate 不合格の helped は数えない
+        fake_run("20990101-000004-b", "helped", loaded=False)  # 読み込んでいない
+        self.assertIn("役立った記録", self.done("--end", "project", "--saved", "W-0720", ok=False))
+        fake_run("20990101-000005-c", "helped")
+        fake_run("20990101-000006-d", "helped")
+        ledger_line("20990101-000006-d", "helped")  # 同じ run の重複は 1 回
         self.done("--end", "project", "--saved", "W-0720")
-        txt = read_file(p)
-        self.assertIn("helped: 2", txt)
+        self.assertIn("helped: 2", read_file(p))
         self._reset()
-        with open(led, "a", encoding="utf-8") as f:
-            f.write(json.dumps({"kind": "use", "memory": "W-0720", "run": "20990101-000003-c", "project": key,
-                                "result": "harmful"}) + "\n")
+        fake_run("20990101-000007-e", "harmful")
         self.assertIn("有害", self.done("--end", "project", "--saved", "W-0720", ok=False))
 
     def _reset(self):
@@ -216,17 +229,34 @@ class TestLifecycle(unittest.TestCase):
         e = self.e
         write_mem(self.proj, "R-0740", status="validated", typ="rule", evidence=f"x/runs/{self.run_id}#V1")
         self.assertIn("人間の承認", self.done("--end", "project", "--saved", "R-0740", ok=False))
+        out = e.aq("memory-approve", "R-0740", ok=False)
+        target = re.search(r"承認 (MEM-R-0740-[0-9a-f]{8})", out).group(1)
         e.aq("ask", "R-0740 を Verified Rule にしますか")
         e.human_says("いいと思う")
         e.aq("memory-approve", "R-0740", ok=False)
-        e.human_says("承認 MEM-R-0740")
+        e.human_says(f"承認 {target}")
         e.aq("memory-approve", "R-0740")
         self.done("--end", "project", "--saved", "R-0740")
         self._reset()
+        # 承認の後に内容を変えると、承認は引き継がない（版に結び付く）
+        write_mem(self.proj, "R-0740", status="validated", typ="rule", evidence=f"x/runs/{self.run_id}#V1",
+                  body="別の内容に書き換えた")
+        self.assertIn("人間の承認", self.done("--end", "project", "--saved", "R-0740", ok=False))
+        # 台帳・監査ログは統括も直接書けない
+        for name in ("ledger.jsonl", "audit.jsonl"):
+            res = e.hook("pre-write", {"tool_name": "Write", "tool_input": {
+                "file_path": os.path.join(self.proj, name), "content": "{}"}})
+            self.assertTrue(denied(res), name)
 
     def test_saving_directly_to_common_is_refused(self):
         write_mem(os.path.join(self.e.home, "memory"), "W-0750", evidence=f"x/runs/{self.run_id}#V1")
         self.assertIn("memory-share", self.done("--end", "project", "--saved", "W-0750", ok=False))
+
+    def test_unverifiable_active_is_loaded_as_candidate(self):
+        write_mem(self.proj, "W-0770", status="active", evidence="runs/20200101-000000-none#V1",
+                  title="根拠のない active")
+        out = self.e.aq("memory", "--tags", "memo", "--all")
+        self.assertIn("根拠を照合できない", out)
 
     def test_legacy_memory_format_is_readable(self):
         d = os.path.join(self.proj, "failure")

@@ -100,8 +100,10 @@ def load_state(project):
         return None, None
     p = os.path.join(d, "state.json")
     s = load_json(p, None)
-    if not s:
-        return None, None
+    if not isinstance(s, dict) or not s.get("run_id"):
+        # CURRENT が指す run の状態を読めない（削除・空・形式違い）。読めないまま許可しないよう異常として扱う
+        raise StateError(f"run の状態（{p}）を読めません（削除・空・形式の違い）。人間に確認してください。"
+                         "やり直す場合は new --force で新しい run を始めます。")
     s = migrate(s)
     s["_rev"] = int(s.get("rev", 0) or 0)
     return s, p
@@ -176,7 +178,7 @@ def validate_state(state):
                     if not ID_RE.match(str(v.get("id", ""))):
                         errs.append(f"{n.get('id')} の検証の ID が不正: {v.get('id')}")
                     if v.get("confirmed_by") == "human" and state.get("eaqdl"):
-                        if not approved(state, target_id("", v.get("id"))):
+                        if not approved(state, f"VERIFY-{v.get('id')}"):
                             errs.append(f"{v.get('id')} が人間の確認済みだが、対象を指定した承認の記録がない")
     for key in ("design", "impl"):
         m = (state.get(key) or {}).get("map", {}) or {}
@@ -190,9 +192,6 @@ def validate_state(state):
             errs.append(f"質問 {q.get('id')} が回答済みだが回答がない")
     sp = state.get("spec") or {}
     if sp.get("approved_hash"):
-        if sp.get("approved_hash") == sp.get("presented_hash") and sp.get("presented_seq") \
-                and sp.get("approved_seq", 0) <= sp.get("presented_seq", 0):
-            errs.append("仕様の承認が提示より前に記録されている")
         if state.get("eaqdl") and not approved(state, target_id("SPEC", sp["approved_hash"])):
             errs.append("仕様が承認済みだが、対象（SPEC-…）を指定した人間の承認の記録がない")
     g = state.get("gate")
@@ -224,6 +223,22 @@ def validate_state(state):
             errs.append(f"Memory の利用範囲が不正: {ms.get('choice')}")
         elif ms.get("choice") == "all" and ms.get("source") not in ("config", "approval"):
             errs.append("共通 Memory の利用が、設定か人間の承認なしに記録されている")
+        elif ms.get("choice") == "all" and ms.get("source") == "approval" and state.get("eaqdl"):
+            import hashlib
+            t = target_id("MEMSCOPE", hashlib.sha1(str(state.get("run_id")).encode()).hexdigest())
+            if not approved(state, t):
+                errs.append("共通 Memory の利用が承認済みとされているが、対象（MEMSCOPE-…）の承認の記録がない")
+    events = {e.get("seq"): e for e in state.get("human_events", [])}
+    for a in state.get("approvals", []):
+        if a.get("decision") not in ("approve", "reject", "revoked"):
+            errs.append(f"承認の記録の決定が不正: {a.get('target')}")
+        elif a.get("decision") in ("approve", "reject") and a.get("target") and \
+                a.get("target") not in (a.get("excerpt") or ""):
+            errs.append(f"承認の記録 {a.get('target')} の元の返答に対象 ID がない")
+        ev = events.get(a.get("event_seq"))
+        if ev is not None and a.get("decision") == "approve" and (ev.get("kind") == "forged" or a["target"] not in ev.get("text", "")):
+            if not any(b.get("target") == a["target"] and b.get("decision") == "revoked" for b in state.get("approvals", [])):
+                errs.append(f"承認の記録 {a.get('target')} が、人間の返答として扱えない記録に基づいている")
     cf = state.get("counterfactual") or {}
     for run in cf.get("runs", []) or []:
         for m in run.get("mutations", []) or []:
@@ -511,6 +526,11 @@ def _problems(ctx, stage):
     bad = validate_state(s)
     if bad:
         out.append(P("state_invalid", "state.json の整合性が取れていない: " + "、".join(bad[:3]), "human"))
+        return out
+    forged = [f["id"] for f in s.get("forged_events", []) if not f.get("resolved")]
+    if forged:
+        out.append(P("forged_human", f"Bash の実行中に記録された「人間の返答」（偽装の疑い）がある: {', '.join(forged)}",
+                     "human"))
         return out
     reg = s.get("config_fp_registered")
     if not reg and s.get("status") in ("in_progress", "pr_ready"):
@@ -856,6 +876,10 @@ def instruction(p, ctx):
             return (head + "\n→ 変更前後の設定（git diff .aq-dlc/config.json、~/.aq-dlc/config.json）を確認し、ask を実行してから"
                     f"人間に変更を受け入れるか確認する（選択肢「受け入れる（承認 {t}）」「元に戻す」）。"
                     f"「承認 {t}」の返答を得たら config-accept \"<人間の返答の要約>\"、受け入れないなら人間に元に戻してもらう。")
+        if c == "forged_human":
+            ids = [f["id"] for f in ctx.state.get("forged_events", []) if not f.get("resolved")]
+            return (head + "\n→ audit で内容を確認し、人間に状況を報告する。ask を実行してから、人間が確認したら"
+                    f"「承認 {ids[0]}」の返答を得て audit --resolve {ids[0]}。取り消された承認は、人間に聞き直して取り直す。")
         if c == "memory_scope":
             from .memory import scope_target
             t = scope_target(ctx.state)
@@ -868,7 +892,7 @@ def instruction(p, ctx):
                     "ask を実行してから人間に方針を確認する（テスト環境を直す / counterfactual.mode を advisory に変える）。")
         if c == "manual_unconfirmed":
             return (head + "\n→ ask \"<確認してほしいこと（まとめて）>\" を実行してから人間に確認する。選択肢は検証ごとに"
-                    "「確認できた（承認 <検証ID>）」の形にし、その返答を得たものを confirm <検証ID> \"<人間の返答の要約>\" で記録する。")
+                    "「確認できた（承認 VERIFY-<検証ID>）」の形にし、その返答を得たものを confirm <検証ID> \"<人間の返答の要約>\" で記録する。")
         return head + "\n→ 修正ループが上限に達した。状況を要約し、ask を実行してから人間に方針を確認する。"
     if r == "orchestrator":
         return (head + "\n→ escalation で内容を確認する。仕様の変更が必要なら人間に確認して aq-dlc:requirements、"

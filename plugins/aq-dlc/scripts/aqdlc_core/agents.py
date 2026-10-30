@@ -450,8 +450,9 @@ def spawn_problem(role, ctx):
     codes = [p["code"] for p in probs]
     if [p for p in probs if p["code"] == "memory_scope"]:
         return "Memory の利用範囲が未選択です。先に人間に確認して memory-scope を実行してください。"
-    if [p for p in probs if p["code"] in ("config_changed", "state_invalid")]:
-        return "設定がエンジンのコマンド以外で変更されています。人間の確認（ask → config-accept）が済むまで進めません。"
+    blk = [p for p in probs if p["code"] in ("config_changed", "state_invalid", "forged_human")]
+    if blk:
+        return blk[0]["msg"] + "。人間の確認が済むまで進めません。"
     spec_block = {"spec_missing", "graph_incomplete", "spec_unregistered", "questions_open",
                   "answers_unapplied", "spec_unpresented", "spec_unapproved", "dup_ids"}
     blocking = [p for p in probs if p["code"] in spec_block]
@@ -914,7 +915,7 @@ BRANCH_SWITCH = re.compile(r"\bgit\s+(?:-C\s+\S+\s+)?(switch\b|checkout\s+(-b|-B
 def check_bash(role, cmd, project, state, cfg):
     if not cfg["automation"].get("enforce_roles", True):
         return None
-    if re.search(r"aqdlc\.py[\"']?\s+[\"']?(hook\b|[a-z-]+-hook\b)", cmd):
+    if re.search(r"aqdlc\.py\s+(hook\b|[a-z-]+-hook\b)", _normalize(cmd)):
         return "hook 用のコマンドは手動で実行できません。"
     subs = ENGINE_RE.findall(cmd)
     for sub in subs:
@@ -985,8 +986,13 @@ def forged_hook(project, hook_name):
     a = load_json(os.path.join(rd, "actor.json"), {}) or {}
     if time.time() - a.get("at", 0) > 60:
         return False
-    cmd = a.get("cmd", "")
+    cmd = _normalize(a.get("cmd", ""))
     return bool(re.search(r"\bhook\b", cmd) and hook_name in cmd)
+
+
+def _normalize(cmd):
+    """引用符・バックスラッシュで語を分ける書き方（ho""ok など）を詰めて判定する（完全ではない）。"""
+    return re.sub(r"[\"'\\]", "", cmd or "")
 
 
 def real_target(path):
@@ -1007,6 +1013,11 @@ def bash_snapshot_dir(project):
     from .project import home
     key = hashlib.sha1(os.path.realpath(project).encode("utf-8")).hexdigest()[:16]
     return os.path.join(home(), "tmp", key)
+
+
+def bash_human_path(project, tool_use_id):
+    safe = re.sub(r"[^A-Za-z0-9_-]", "_", tool_use_id or "last")[:80]
+    return os.path.join(bash_snapshot_dir(project), f"human-{safe}.json")
 
 
 def bash_snapshot_path(project, tool_use_id):
@@ -1052,8 +1063,11 @@ def check_write(role, path, project, state, cfg):
     arts = os.path.relpath(norm(artifacts_dir(rd)), norm(project)).replace(os.sep, "/") if rd else None
     base = os.path.basename(rel)
     if rel.startswith(".aq-dlc/"):
-        if base in ("state.json", "config.json", "project.json", "actor.json"):
-            return f"{base} は直接編集できません。エンジンのコマンドで更新してください。"
+        if base in ("state.json", "config.json", "project.json", "actor.json", "ledger.jsonl", "audit.jsonl",
+                    "CURRENT") or base.endswith(".lock"):
+            return f"{base} は直接編集できません（エンジンが記録します）。"
+        if rel.startswith(".aq-dlc/runs/") and base != "run.md" and not (arts and rel.startswith(arts + "/")):
+            return "run の記録（gate・反証テストのログなど）はエンジンが書き込みます。"
         if arts and rel.startswith(arts + "/"):
             own = {"spec.md": "requirements", "design.md": "design", "impl.md": "implementer"}.get(rel[len(arts) + 1:])
             if own is None:

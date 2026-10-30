@@ -17,7 +17,7 @@ Memoryの本文・見出し・タグ以外の記述、run.md への記録、ユ�
 
 ## エンジンが確かめること（量ではなく、証拠と再利用性）
 - run の最初に読む Memory は `memory --tags <タグ> --record` で記録する（上限 `max_loaded_per_run`、利用範囲の中だけ）。
-- 読み込んだ Memory（参考を除く）ごとに、使った結果を `memory-use <ID> --result helped|not_applicable|harmful|unknown --note "<内容>"` で記録する。エンジンが台帳（`ledger.jsonl`）に、run・その時点の gate の状態と一緒に残す。外れたもの・失敗したものも記録する。
+- 読み込んだ Memory（参考を除く）ごとに、使った結果を `memory-use <ID> --result helped|not_applicable|harmful|unknown --note "<内容>"` で記録する。エンジンが台帳（`ledger.jsonl`）に、run・その時点の gate の状態と一緒に残す。昇格の判定には、その run の state で裏付けられる記録（読み込み済み・同じ結果・helped は gate 合格）だけを数える。台帳は直接編集できない。外れたもの・失敗したものも記録する。
 - `memory-done` には、終了時の保存先と、保存・統合した ID、保存しなかった理由を渡す:
   `memory-done --end project|share|none --saved F-0003 --merged W-0001 --skipped "<見送った候補と理由>"`
 - エンジンは次を確かめ、満たさなければ完了にしない:
@@ -25,7 +25,7 @@ Memoryの本文・見出し・タグ以外の記述、run.md への記録、ユ�
   - `validated` / `active` の根拠（`runs/<run_id>#<検証ID>`）が、このプロジェクトに実在する run・検証で、その gate で合格している（Markdown に ID を書くだけでは validated にならない）
   - `active` は、根拠の run 以外の異なる `promote_to_active_min_runs` 個以上の run で helped の記録が台帳にあり、harmful の記録がない
   - `deprecated` には理由（`deprecated_reason`）がある。削除しない
-  - Verified Rule（`type: rule`）の validated / active には、人間の承認の記録がある（`ask` → 「承認 MEM-<ID>」→ `memory-approve <ID>`）
+  - Verified Rule（`type: rule`）の validated / active には、人間の承認の記録がある（`memory-approve <ID>` で対象 ID `MEM-<ID>-<内容の指紋>` を確認 → `ask` → 「承認 MEM-<ID>-…」→ `memory-approve <ID>`。内容を変えたら承認し直す）
   - 同じ保存先で同じ ID・同じ題名の Memory が重複していない（統合する）
   - 読み込んだ Memory の利用結果がすべて記録されている
   - `--end share` なら、すべての共有候補に人間の決定（承認か却下）がある

@@ -150,9 +150,9 @@ class CompletionTest(unittest.TestCase):
         e.aq("confirm", "V8", "見ました", ok=False)  # ask の後の人間の返答がない
         e.aq("ask", "公開URLを開いて確認してください")
         e.human_says("開けました")
-        e.aq("confirm", "V8", "対象のない返答", ok=False)  # 「承認 V8」がない返答は確認にしない
-        e.aq("ask", "公開URLを開いて確認してください（確認できたら「承認 V8」）")
-        e.human_says("承認 V8")
+        e.aq("confirm", "V8", "対象のない返答", ok=False)  # 「承認 VERIFY-V8」がない返答は確認にしない
+        e.aq("ask", "公開URLを開いて確認してください（確認できたら「承認 VERIFY-V8」）")
+        e.human_says("承認 VERIFY-V8")
         e.aq("confirm", "V8", "ユーザーが公開URLを確認")
         e.aq("gate", "--after-merge")
         e.aq("complete")

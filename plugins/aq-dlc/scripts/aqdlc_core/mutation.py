@@ -56,11 +56,11 @@ def _skip_line(line, lang):
     return t.startswith(("//", "/*", "*", "import ", "export {"))
 
 
-def _in_string(line, pos):
-    """pos が文字列リテラルの中か（1行の中での簡易な判定）。"""
+def _in_string(line, pos, lang="python"):
+    """pos がコードではない（文字列リテラルの中、または行コメントの後）か（1行の中での簡易な判定）。"""
     q = None
     i = 0
-    while i < pos:
+    while i < pos and i < len(line):
         ch = line[i]
         if q:
             if ch == "\\":
@@ -70,16 +70,54 @@ def _in_string(line, pos):
                 q = None
         elif ch in "\"'`":
             q = ch
-        elif ch == "#" and False:
-            pass
+        elif ch == "#" and lang == "python":
+            return True
+        elif ch == "/" and line[i:i + 2] == "//" and lang == "js":
+            return True
         i += 1
     return q is not None
+
+
+_MASK_CACHE = {}
+
+
+def masked_lines(lines, lang):
+    """複数行の文字列（docstring）・ブロックコメントの中にある行の番号の集合。"""
+    key = (id(lines), len(lines), lang)
+    if key in _MASK_CACHE:
+        return _MASK_CACHE[key]
+    out, inside = set(), None
+    for i, ln in enumerate(lines):
+        if inside:
+            out.add(i)
+            if inside in ln:
+                inside = None
+            continue
+        if lang == "python":
+            for d in ('"""', "'''"):
+                if ln.count(d) % 2 == 1:
+                    out.add(i)
+                    inside = d
+                    break
+                if ln.strip().startswith(d):
+                    out.add(i)  # 1行の docstring
+        else:
+            t = ln.strip()
+            if t.startswith("/*") or t.startswith("*"):
+                out.add(i)
+            if "/*" in ln and "*/" not in ln[ln.index("/*"):]:
+                out.add(i)
+                inside = "*/"
+    if len(_MASK_CACHE) > 64:
+        _MASK_CACHE.clear()
+    _MASK_CACHE[key] = out
+    return out
 
 
 def _js_if_cond(line):
     """`if (` の位置と、対応する `)` の位置。"""
     m = re.search(r"\bif\s*\(", line)
-    if not m or _in_string(line, m.start()):
+    if not m or _in_string(line, m.start(), "js"):
         return None
     start = m.end() - 1
     depth = 0
@@ -133,7 +171,7 @@ def apply(op, lines, i, lang):
     if i < 0 or i >= len(lines):
         return None
     line = lines[i]
-    if _skip_line(line, lang) and op != "sql_where":
+    if _skip_line(line, lang) or i in masked_lines(lines, lang):
         return None
     nl = "\n" if line.endswith("\n") else ""
     body = line[:-1] if nl else line
@@ -157,7 +195,7 @@ def apply(op, lines, i, lang):
                 new = body[:s + 1] + repl + body[e:]
     elif op == "boundary":
         for m in re.finditer(r"(?<=[\w)\]'\"])(\s+)(<=|>=|<|>)(\s+)", body):
-            if _in_string(body, m.start(2)):
+            if _in_string(body, m.start(2), lang):
                 continue
             if lang == "js" and body[m.start(2) - 1:m.start(2)] in ("=", "-"):
                 continue
@@ -169,7 +207,7 @@ def apply(op, lines, i, lang):
         best = None
         for a, b in pats:
             for m in re.finditer(re.escape(a), body):
-                if _in_string(body, m.start()):
+                if _in_string(body, m.start(), lang):
                     continue
                 if lang == "js" and a in ("==", "!=") and (body[m.end():m.end() + 1] == "=" or
                                                            body[m.start() - 1:m.start()] in ("=", "!")):
@@ -186,7 +224,7 @@ def apply(op, lines, i, lang):
         best = None
         for pat, b in pats:
             for m in re.finditer(pat, body):
-                if _in_string(body, m.start()):
+                if _in_string(body, m.start(), lang):
                     continue
                 if best is None or m.start() < best[0]:
                     best = (m.start(), m.end(), b)
@@ -204,7 +242,7 @@ def apply(op, lines, i, lang):
                     new = f"{m.group(1)}{m.group(2)} {m.group(3)}: pass"
         else:
             m = re.search(r"\bthrow\b[^;]*;?", body)
-            if m and not _in_string(body, m.start()):
+            if m and not _in_string(body, m.start(), lang):
                 new = body[:m.start()] + "void 0;" + body[m.end():]
     elif op == "return_bool":
         pairs = {"True": "False", "False": "True"} if lang == "python" else {"true": "false", "false": "true"}

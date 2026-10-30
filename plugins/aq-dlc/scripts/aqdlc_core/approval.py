@@ -37,6 +37,9 @@ def phrase(target, decision="承認"):
 
 # ------------------------------------------------------------------ 返答からの決定の読み取り
 _SEG_SPLIT = re.compile(r"[\n,、;；]")
+ANY_DECISION = re.compile(r"(承認|却下|approve|reject)\s*[:：]?\s*[A-Za-z]+-[A-Za-z0-9_.@-]+", re.I)
+NEGATIVE = re.compile(r"承認しない|承認できない|承認せず|却下|修正したい|修正して|直して|やめ|見送|保留|待って|不可|反対|"
+                      r"\bnot\b|\bno\b|reject|don't|do not", re.I)
 
 
 def decisions_in(text, target):
@@ -50,7 +53,7 @@ def decisions_in(text, target):
     if not text or not target:
         return None, set()
     t = re.escape(target)
-    found, flags = set(), set()
+    found, flags, negative = set(), set(), False
     pat = re.compile(
         rf"^(?:[^\n]{{0,60}}?[（(]\s*)?(承認|却下|approve|reject)\s*[:：]?\s*{t}(?![A-Za-z0-9_.-])"
         rf"\s*({CONFIDENTIAL_OK})?\s*[)）]?\s*[。.!！]?$", re.I)
@@ -63,11 +66,22 @@ def decisions_in(text, target):
             continue
         word = m.group(1).lower()
         found.add("approve" if word in ("承認", "approve") else "reject")
+        prefix = s[:m.start(1)]
+        if NEGATIVE.search(prefix):
+            negative = True  # 「却下したい（承認 …）」のような前置き
         if m.group(2):
             flags.add(CONFIDENTIAL_OK)
     if len(found) != 1:
         return None, flags  # 決定なし、または承認と却下が混在（曖昧）
-    return found.pop(), flags
+    d = found.pop()
+    for seg in _SEG_SPLIT.split(text):
+        if ANY_DECISION.search(seg):
+            continue  # 他の対象への決定（「共有しない（却下 SHARE-…）」など）は除く
+        if NEGATIVE.search(seg):
+            negative = True
+    if d == "approve" and negative:
+        return None, flags  # 「修正したい」「承認しない」などの否定・保留と一緒に書かれた承認は曖昧として扱う
+    return d, flags
 
 
 def find_decision(state, target, after_seq):
@@ -88,12 +102,19 @@ def record(state, target, decision, event, run_dir=None, note="", kind=""):
     """承認の記録を state と run の監査ログに残す。"""
     rec = {"target": target, "decision": decision, "kind": kind, "at": now_iso(),
            "run": state.get("run_id"), "event_seq": (event or {}).get("seq"),
-           "source": (event or {}).get("kind"), "excerpt": ((event or {}).get("text") or "")[:120],
+           "source": (event or {}).get("kind"), "excerpt": _excerpt((event or {}).get("text") or "", target),
            "note": (note or "")[:300]}
     state.setdefault("approvals", []).append(rec)
     if run_dir:
         audit_append(os.path.join(run_dir, "audit.jsonl"), "approval", **rec)
     return rec
+
+
+def _excerpt(text, target):
+    for seg in _SEG_SPLIT.split(text):
+        if target in seg:
+            return seg.strip()[:200]
+    return text[:120]
 
 
 def approved(state, target):
